@@ -1,0 +1,28 @@
+# holds channel PSKs and PKI private keys
+config.jsonc
+nodes.json
+nodes.json.tmp
+*.jsonl
+
+# local gr-lora_sdr build
+deps/
+
+# IQ recordings
+*.cu8
+*.cf32
+*.iq
+
+__pycache__/
+gui_settings.json
+logs/
+keys.jsonc
+config.jsonc.bak*
+nodes_meshcore.json
+.keys.*.tmp
+
+# captures, logs and screenshots from runs
+*.pcapng
+*.pcap
+*.log
+*.png
+*.svg

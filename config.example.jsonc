@@ -1,0 +1,131 @@
+// LoRaSpy configuration (JSON with comments; trailing commas allowed).
+// Copy to config.jsonc and edit. config.jsonc holds keys — do not commit it.
+{
+  // Meshtastic region; decides which frequency each Meshtastic preset lands on.
+  // US, EU_433, EU_868, CN, JP, ANZ, ANZ_433, RU, KR, TW, IN, NZ_865, TH, UA_433, UA_868,
+  // MY_433, MY_919, SG_923, PH_433, PH_868, PH_915, KZ_433, KZ_863, NP_865, BR_902
+  "region": "EU_868",
+
+  "sdr": {
+    "device": "rtl=0",          // gr-osmosdr device string
+    "sample_rate": 2000000,     // must be a whole or rational multiple of 4 × each receiver's bandwidth
+    "gain": 40,                 // dB, or "auto"
+    "ppm": 0,                   // tuner frequency correction (RTL-SDR v4 has a TCXO, usually ~0)
+    // Tuner frequency is picked automatically so every receiver fits and the RTL-SDR's
+    // DC spike stays dc_clearance_hz outside every channel. Set center_frequency_hz to override.
+    "dc_clearance_hz": 25000,
+    // RSSI: LoRaSpy measures each frame's in-band power in dBFS. To report dBm, set the
+    // offset (dBm = dBFS + offset). It depends on the gain, so re-calibrate if you change gain,
+    // and don't use "auto" gain. See README "RSSI and SNR" for a calibration method.
+    // "rssi_offset_db": -60,
+    // "center_frequency_hz": 868844000,
+    "bias_tee": false,          // power an LNA through the coax (RTL-SDR v4 supports this)
+  },
+
+  // One or more demodulators per entry, all fed from the same SDR. Receivers on the same
+  // frequency and bandwidth share one channel filter, so extra spreading factors are cheap.
+  // All receivers together must fit in about 90 % of sample_rate.
+  //
+  // Meshtastic ("protocol" may be omitted):
+  //   { "preset": "LONG_FAST" }  — frequency derived exactly like the firmware does
+  //       optional: "primary_channel" (name that picks the frequency slot, default = preset name),
+  //                 "channel_num" (1-based slot override), "frequency_offset_hz"
+  //   { "name": "custom", "frequency_hz": 869525000, "bandwidth_hz": 250000,
+  //     "spreading_factor": 11, "coding_rate": 5 }
+  //   Presets: SHORT_TURBO SHORT_FAST SHORT_SLOW MEDIUM_FAST MEDIUM_SLOW LONG_TURBO LONG_FAST LONG_MODERATE LONG_SLOW
+  //
+  // LoRaWAN (sync word 0x34):
+  //   { "protocol": "lorawan", "plan": "EU868" }       868.1/868.3/868.5 MHz × SF7-12, SF7BW250 on 868.3,
+  //                                                     RX2 downlinks 869.525 MHz SF9 (TTN) + SF12 (spec)
+  //   { "protocol": "lorawan", "plan": "EU868_TTN" }   adds TTN's 867.1-867.9 MHz — spans 2.6 MHz, needs
+  //                                                     sample_rate 3200000 (at the RTL-SDR's USB limit)
+  //   options: "spreading_factors": [7, 12], "sf7bw250": false, "rx2": false,
+  //            "rx1": true  (also listen for RX1 downlinks: inverted IQ on the uplink channels)
+  //   explicit: { "protocol": "lorawan", "frequency_hz": 868100000, "bandwidth_hz": 125000,
+  //               "spreading_factors": [7, 8, 9], "downlink": false }
+  //
+  // MeshCore (sync word 0x12):
+  //   { "protocol": "meshcore", "preset": "EU_UK_NARROW" }   869.618 MHz, 62.5 kHz, SF8 (firmware default)
+  //   { "protocol": "meshcore", "frequency_hz": ..., "bandwidth_hz": ..., "spreading_factor": ... }
+  "receivers": [
+    { "preset": "LONG_FAST" },
+    // { "preset": "MEDIUM_SLOW" },   // same frequency as LongFast on EU_868, different SF
+    // Every EU_868 preset at once. The 125 kHz presets have two slots in EU_868,
+    // chosen by the primary channel name:
+    // { "preset": "SHORT_FAST" }, { "preset": "SHORT_SLOW" }, { "preset": "MEDIUM_FAST" },
+    // { "preset": "LONG_MODERATE", "primary_channel": "LongFast" }, { "preset": "LONG_SLOW", "primary_channel": "LongFast" },
+    // { "protocol": "lorawan", "plan": "EU868" },
+    // { "protocol": "meshcore", "preset": "EU_UK_NARROW" },
+  ],
+
+  // ---------------------------------------------------------------- Meshtastic keys
+  // Keys and channels can also be added at runtime (GUI 🔑 Keys, TUI k, `loraspy.py keys`);
+  // those are stored in keys.jsonc next to this file and merged with the sections below.
+  // Channel keys. A packet's header carries hash(name, psk); every channel whose
+  // hash matches is tried. PSK is base64, same as in the Meshtastic apps:
+  //   "AQ==" = default key, "AA==" = no encryption, 16 or 32 raw bytes for custom keys.
+  // Unicasts that don't use PKI (NodeInfo/traceroute requests, ACKs, DMs from pre-2.5
+  // firmware) are encrypted with the channel key, so they decode through this list too.
+  "channels": [
+    { "name": "LongFast", "psk": "AQ==" },
+    // { "name": "MyPrivate", "psk": "base64-16-or-32-byte-key=" },
+  ],
+
+  // Direct messages from firmware 2.5+ use PKI (X25519 + AES-CCM), not a PSK.
+  // To read them you need the private key of one of the two parties:
+  // either the recipient's (plus the sender's public key) or the sender's
+  // (plus the recipient's public key). Public keys are learned automatically
+  // from NODEINFO packets heard on air and kept in node_db_file; you can also
+  // pin them under public_keys. Only use keys of nodes you own/administer.
+  "pki": {
+    "private_keys": [
+      // { "node": "!1337b4b3", "private_key": "base64-32-bytes=", "label": "my T-Beam" },
+    ],
+    "public_keys": {
+      // "!da548c90": "base64-32-bytes=",
+    },
+  },
+
+  // ---------------------------------------------------------------- MeshCore keys
+  "meshcore": {
+    // Group channels. "secret" is hex or base64 (16 or 32 bytes). A "#name" channel without
+    // a secret uses MeshCore's hashtag rule: secret = sha256("#name")[:16].
+    // If this list is omitted, only the default Public channel is used.
+    "channels": [
+      { "name": "Public", "secret": "8b3387e9c5cdea6ac9e5edbaa115cd72" },
+      // { "name": "#test" },
+      // { "name": "Friends", "secret": "hex-or-base64-16-bytes" },
+    ],
+    // Your own identities, for reading DMs to/from them: the 64-byte private key from the
+    // app's "export private key" (hex). Peers' public keys are learned from their adverts.
+    "identities": [
+      // { "name": "my companion", "private_key": "128 hex characters" },
+    ],
+    // Pin peers' Ed25519 public keys if you haven't heard their advert yet.
+    "public_keys": {
+      // "Alice": "64 hex characters",
+    },
+  },
+
+  // ---------------------------------------------------------------- LoRaWAN keys
+  // Without keys you still see join requests (DevEUI/JoinEUI), DevAddr, FCnt, FPort.
+  // With a device's session keys (ABP, or copied from your network server's console)
+  // the MIC is verified and FRMPayload decrypted. Only for devices you own.
+  "lorawan": {
+    "sessions": [
+      // { "dev_addr": "260B1234", "nwk_s_key": "32 hex", "app_s_key": "32 hex", "label": "garden sensor" },
+    ],
+  },
+
+  // Learned Meshtastic node names + public keys (relative to this file); MeshCore adverts go
+  // to <name>_meshcore.json next to it. null disables.
+  "node_db_file": "nodes.json",
+
+  "output": {
+    "format": "text",           // text | hex | hextext
+    "colored": true,
+    "show_crc_errors": false,   // print frames whose LoRa CRC failed
+    "show_undecrypted": true,   // print packets no key could decrypt
+    "jsonl_file": null,         // e.g. "log/packets.jsonl" — one JSON object per frame
+  },
+}

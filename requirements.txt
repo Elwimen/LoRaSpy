@@ -1,0 +1,7 @@
+# GNU Radio 3.10 + gr-osmosdr come from the distro (pacman -S gnuradio gnuradio-osmosdr rtl-sdr);
+# gr-lora_sdr from scripts/build_gr_lora_sdr.sh or AUR gr-lora_sdr-git.
+meshtastic>=2.5
+cryptography
+protobuf
+numpy
+scipy  # only for tools/simulate_iq.py
