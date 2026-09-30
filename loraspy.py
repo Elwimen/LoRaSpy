@@ -153,6 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
                         epilog="""\
 examples:
   loraspy.py keys                                   list everything (secrets masked)
+  loraspy.py keys show                              the same with the keys in full
+  loraspy.py keys show channel                      only Meshtastic channels (keys in full)
+  loraspy.py keys show channel 0                    one entry: keys.jsonc channel #0
   loraspy.py keys kinds                             key types and their fields
   loraspy.py keys add channel name=MyChannel psk=base64key=
   loraspy.py keys add channel name=MyChannel psk=random     (new random AES-256 PSK)
@@ -162,7 +165,9 @@ examples:
   loraspy.py keys edit channel 0 psk=otherkey=        change only the given fields
   loraspy.py keys remove channel 0                  (N = the #N shown by 'keys')
 """)
-    kp.add_argument("action", nargs="?", default="list", choices=["list", "kinds", "add", "edit", "remove"])
+    kp.add_argument("action", nargs="?", default="list", choices=["list", "show", "kinds", "add", "edit", "remove"],
+                    help="list (secrets masked), show (keys in full), kinds, add, edit, remove; "
+                         "list/show take an optional KIND and entry N to narrow it down")
     kp.add_argument("kind", nargs="?", help="channel, pki-private, pki-public, mc-channel, mc-identity, "
                                             "mc-public, lw-session, lw-otaa")
     kp.add_argument("rest", nargs="*", metavar="N|field=value", help="edit/remove: the entry number N; "
@@ -578,6 +583,8 @@ def _keys_action(args, store, live: bool) -> int:
     where = "applied to the running LoRaSpy" if live else \
         "saved to keys.jsonc; applies when LoRaSpy starts"
     act, kind = args.action, args.kind
+    if act in ("list", "show") and kind is not None and kind not in keystore.KINDS:
+        raise ValueError(f"unknown kind '{kind}'; one of: {', '.join(keystore.KINDS)}")
     if act in ("add", "edit", "remove") and kind not in keystore.KINDS:
         raise ValueError(f"which kind? one of: {', '.join(keystore.KINDS)} (see 'keys kinds')")
     if act == "add":
@@ -597,12 +604,25 @@ def _keys_action(args, store, live: bool) -> int:
                 raise ValueError(f"{kind} #{n}: no such entry in keys.jsonc")
             store.keys_update(kind, n, random_fill(kind, {**cur["fields"], **parse_fields(args.rest[1:])}))
             print(f"updated ({where})")
-    if act != "list":
+    if act not in ("list", "show"):
         return 0
 
+    reveal = act == "show" or args.show_secrets
+    only = None
+    if args.rest:
+        if kind is None or not args.rest[0].isdigit():
+            raise ValueError(f"{act}: expected KIND [N], e.g. 'keys {act} channel 0'")
+        only = int(args.rest[0])
     entries = store.keys_list()
+    if kind is not None:
+        entries = [e for e in entries if e["kind"] == kind]
+    if only is not None:
+        entries = [e for e in entries if e["source"] == "keys" and e["index"] == only]
+        if not entries:
+            raise ValueError(f"{kind} #{only}: no such entry in keys.jsonc")
     print(f"keys: {'live, from the running LoRaSpy' if live else 'from the config files'}   "
-          f"(#N = editable in keys.jsonc, 'config' = edit config.jsonc)")
+          f"(#N = editable in keys.jsonc, 'config' = edit config.jsonc)"
+          + ("" if reveal else "   — 'keys show' prints them in full"))
     for k in keystore.KINDS.values():
         mine = [e for e in entries if e["kind"] == k.kind]
         if not mine:
@@ -614,7 +634,7 @@ def _keys_action(args, store, live: bool) -> int:
             for f in k.fields:
                 v = e["fields"].get(f.name, "")
                 if v:
-                    vals.append(f"{f.name}={v if args.show_secrets or not f.secret else keystore.mask(v)}")
+                    vals.append(f"{f.name}={v if reveal or not f.secret else keystore.mask(v)}")
             print(f"  {ref:<7} {'  '.join(vals)}" + (f"   ({e['info']})" if e["info"] else ""))
     return 0
 

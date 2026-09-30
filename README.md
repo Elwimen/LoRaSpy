@@ -238,7 +238,9 @@ over at once (no restart), and every attached front-end sees it:
 - **CLI** (also for headless `serve`/`listen`; without a running LoRaSpy it edits the
   file, applied at the next start):
   ```bash
-  ./loraspy.py keys                                     # list (secrets masked; --show-secrets)
+  ./loraspy.py keys                                     # list (secrets masked)
+  ./loraspy.py keys show                                # the same with the keys in full
+  ./loraspy.py keys show channel 0                      # just one type / one entry
   ./loraspy.py keys kinds                               # types and their fields
   ./loraspy.py keys add channel name=MyChannel psk=base64key=
   ./loraspy.py keys add channel name=MyChannel psk=random   # new random AES-256 PSK
