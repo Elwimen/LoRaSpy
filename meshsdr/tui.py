@@ -267,6 +267,7 @@ class Stats(Static):
 
 
 class MonitorTUI(App):
+    TITLE = "LoRaSpy"
     CSS = f"""
     Screen {{ background: {BTOP['bg']}; color: {BTOP['fg']}; }}
     Stats {{ height: 1; background: {BTOP['bg']}; }}

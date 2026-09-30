@@ -26,3 +26,6 @@ nodes_meshcore.json
 *.log
 *.png
 *.svg
+
+# README screenshots (made from simulated data, no real keys)
+!docs/screenshots/*.png

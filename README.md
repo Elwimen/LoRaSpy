@@ -3,7 +3,11 @@
 Receive-only LoRa monitor for **Meshtastic**, **LoRaWAN** and **MeshCore**. An **RTL-SDR v4**
 and **GNU Radio** (with [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr)) demodulate
 LoRa frames off the air, then Python decrypts and decodes them. Output uses the same styles
-as [meshprobe](../meshprobe): `text`, `hex`, `hextext`.
+as meshprobe: `text`, `hex`, `hextext`.
+
+![LoRaSpy TUI: spectrum and waterfall with band overlays, decoders, live packets and packet details](docs/screenshots/tui.png)
+<sub>The btop-style TUI (`--tui`) decoding a simulated recording (`tools/simulate_iq.py`):
+LoRaWAN uplinks/downlinks on 868.1–868.5 MHz, Meshtastic and MeshCore around 869.5 MHz.</sub>
 
 | Protocol | EU defaults | Decodes |
 |---|---|---|
@@ -112,7 +116,7 @@ overlays** built from your receivers (every LoRaWAN channel separately, marked �
 lights up when a packet is decoded in it; a live packet list with full details; and
 decoder toggles.
 
-**`--tui`** (Textual, styled after btop's default theme):
+**`--tui`** (Textual, styled after btop's default theme; screenshot at the top):
 - A stats line: tuner, uptime, CPU, and frames per protocol.
 - A spectrum panel: level bars, a waterfall covering about 20 s with ◆ marks where packets
   were decoded, a band ruler, and a frequency axis.
@@ -233,7 +237,7 @@ over at once (no restart), and every attached front-end sees it:
   key type with Add / Edit / Remove, a form that checks the entry as you type (shows the
   channel hash or derived public key, or what's wrong), a *Random* button for new PSKs /
   secrets, and *Show keys* to unmask.
-- **TUI:** key `k`: list of all entries; `a` add (pick the type, fill the form, `^R` random
+- **TUI:** key `k` (screenshots below): list of all entries; `a` add (pick the type, fill the form, `^R` random
   key, `^T` show/hide, `^S` save), `e`/Enter edit, `d` delete, `s` show keys, Esc back.
 - **CLI** (also for headless `serve`/`listen`; without a running LoRaSpy it edits the
   file, applied at the next start):
@@ -250,6 +254,10 @@ over at once (no restart), and every attached front-end sees it:
   ./loraspy.py keys edit channel 0 psk=otherkey=        # only the given fields change
   ./loraspy.py keys remove channel 0                    # N = the #N from `keys`
   ```
+
+| Keys & channels (TUI `k`) | Adding a channel (`a`, `^R` random key) |
+|---|---|
+| ![TUI key list](docs/screenshots/tui-keys.png) | ![TUI add-channel form](docs/screenshots/tui-keys-add.png) |
 
 Types: `channel` (Meshtastic name + PSK), `pki-private` / `pki-public` (Meshtastic DMs),
 `mc-channel`, `mc-identity`, `mc-public` (MeshCore), `lw-session` (ABP / session keys),
