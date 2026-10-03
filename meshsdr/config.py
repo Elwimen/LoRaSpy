@@ -222,6 +222,52 @@ class Config:
 KEYS_FILE = "keys.jsonc"
 
 
+DECODERS_FILE = "decoders.jsonc"
+OVERRIDABLE = ("frequency_hz", "bw_hz", "sf", "cr", "sync_word", "invert_iq")
+
+
+def decoders_path_for(config_path: str | Path) -> Path:
+    return Path(config_path).resolve().parent / DECODERS_FILE
+
+
+def resolve_added(region: str, spec: dict):
+    """A decoders.jsonc "add" entry: a normal receiver spec, plus optional "sync_word" and
+    "invert_iq" applied to every receiver it produces."""
+    rxs = resolve_receivers(region, {k: v for k, v in spec.items() if k not in ("sync_word", "invert_iq")})
+    name = str(spec.get("name") or "").strip()
+    if name and len(rxs) > 1 and not all(rx.name.startswith(name) for rx in rxs):
+        for rx in rxs:                   # plans / channel sets: the name becomes a prefix
+            rx.name = f"{name} {rx.name}"
+    for rx in rxs:
+        if "sync_word" in spec:
+            rx.sync_word = int(str(spec["sync_word"]), 0) & 0xFF
+        if "invert_iq" in spec:
+            rx.invert_iq = bool(spec["invert_iq"])
+    return rxs
+
+
+def apply_overrides(receivers, overrides: dict):
+    """decoders.jsonc "override": {receiver name: {frequency_hz, bw_hz, sf, cr, sync_word, invert_iq}}."""
+    by_name = {r.name: r for r in receivers}
+    for name, o in overrides.items():
+        rx = by_name.get(name)
+        if rx is None:
+            continue                     # the receiver went away from the config: ignore its override
+        for k, v in o.items():
+            if k not in OVERRIDABLE:
+                raise ValueError(f"override for '{name}': unknown parameter '{k}' (allowed: {', '.join(OVERRIDABLE)})")
+            if k == "sync_word":
+                v = int(str(v), 0) & 0xFF
+            elif k == "invert_iq":
+                v = bool(v)
+            elif k in ("bw_hz", "sf", "cr"):
+                v = int(v)
+            else:
+                v = float(v)
+            setattr(rx, k, v)
+        rx.overridden = True
+
+
 def keys_path_for(config_path: str | Path) -> Path:
     return Path(config_path).resolve().parent / KEYS_FILE
 
@@ -346,10 +392,16 @@ def load_config(path: str | Path) -> Config:
     sdr = SdrConfig(**{k: v for k, v in sdr_raw.items() if k in SdrConfig.__dataclass_fields__})
 
     receiver_specs = raw.get("receivers") or [{"preset": "LONG_FAST"}]
+    dec = load_jsonc(decoders_path_for(path)) if decoders_path_for(path).exists() else {}
     try:
         receivers = [rx for spec in receiver_specs for rx in resolve_receivers(region, spec)]
-    except ValueError as e:
-        raise ConfigError(str(e)) from e
+        for i, spec in enumerate(dec.get("add", [])):
+            for rx in resolve_added(region, spec):
+                rx.origin, rx.spec_index = "added", i
+                receivers.append(rx)
+        apply_overrides(receivers, dec.get("override", {}))
+    except (ValueError, TypeError, KeyError) as e:
+        raise ConfigError(f"{e} (receivers in config.jsonc / {DECODERS_FILE})") from e
     names = [r.name for r in receivers]
     for dup in {n for n in names if names.count(n) > 1}:
         raise ConfigError(f"Two receivers are both named '{dup}'; give one an explicit \"name\"")

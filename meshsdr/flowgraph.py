@@ -264,6 +264,9 @@ def plan_center(receivers: list[ReceiverParams], sample_rate: float, dc_clearanc
     channel with some clearance. Among the valid choices prefer the one with the most
     DC clearance (capped at 100 kHz), then the most margin from the band edges.
     """
+    # decoders added from the UIs (decoders.jsonc) may be anywhere, e.g. another region: they don't
+    # steer the tuner, they idle while outside its window (like after a retune)
+    receivers = [r for r in receivers if r.origin == "config"] or receivers
     usable = sample_rate / 2 * 0.9
     lo_min = max(r.frequency_hz + r.bw_hz / 2 for r in receivers) - usable
     lo_max = min(r.frequency_hz - r.bw_hz / 2 for r in receivers) + usable
@@ -299,7 +302,8 @@ class MonitorFlowgraph(gr.top_block):
                  on_frame: Callable[[RxFrame], None], iq_file: str | None = None,
                  iq_format: str = "cu8", iq_center_hz: float | None = None, soft_decoding: bool = True,
                  on_spectrum: Callable[[np.ndarray], None] | None = None, fft_size: int = 1024,
-                 realtime: bool = False, iq_loop: bool = False, spectrum_window=None):
+                 realtime: bool = False, iq_loop: bool = False, spectrum_window=None,
+                 center_hz: float | None = None):
         gr.top_block.__init__(self, "lora_sdr_monitor", catch_exceptions=True)
         self._keep: list = []   # see connect()
         # [freq_xlating filter, frequency it extracts, reference (None = tuner centre)]: retuning
@@ -329,7 +333,9 @@ class MonitorFlowgraph(gr.top_block):
                 self.connect(source, throttle)
                 source = throttle
         else:
-            center = plan_center(receivers, samp_rate, sdr.dc_clearance_hz, sdr.center_frequency_hz)
+            # a rebuild keeps the current tuning (decoders outside it just idle)
+            center = center_hz if center_hz is not None else \
+                plan_center(receivers, samp_rate, sdr.dc_clearance_hz, sdr.center_frequency_hz)
             source = self._rtl_source(sdr, center)
             self._rtl = source
         self.center_hz = center
@@ -430,6 +436,7 @@ class MonitorFlowgraph(gr.top_block):
             self.py_blocks += [snr, sink]
         self._build_fsk([rx for rx in receivers if rx.protocol == "trustedwireless"], source, center, samp_rate,
                         on_frame)
+        self._update_range()
         self._apply_gates()
         self._topo_lock = threading.RLock()   # start/stop (watchdog vs. shutdown)
         self.running = False
@@ -455,10 +462,11 @@ class MonitorFlowgraph(gr.top_block):
         lo = min(r.frequency_hz for r in rxs) - 20e3
         hi = max(r.frequency_hz for r in rxs) + 20e3
         mid = (lo + hi) / 2
-        decim_w = max(1, int(samp_rate // 250e3))
+        # the block's rate follows the span (one grid ~210 kHz, both interleaved grids ~240 kHz)
+        decim_w = max(1, int(samp_rate // ((hi - lo) * 1.15)))
         rate_w = samp_rate / decim_w
         if (hi - lo) / 2 > rate_w * 0.45:
-            raise ValueError("trustedwireless channels span more than the 250 kHz block they are cut out with")
+            raise ValueError("trustedwireless channels span more than the SDR's bandwidth allows")
         fgate = blocks.copy(gr.sizeof_gr_complex)
         wide = filter.freq_xlating_fir_filter_ccc(decim_w, firdes.low_pass(1.0, samp_rate, (hi - lo) / 2 + 5e3, 20e3),
                                                   mid - center, samp_rate)
@@ -646,6 +654,16 @@ class MonitorFlowgraph(gr.top_block):
 
     def _snap_gain(self, db: float) -> float:
         return min(self.gain_steps, key=lambda g: abs(g - db)) if self.gain_steps else db
+
+    def close(self):
+        """Release the SDR of a stopped flowgraph so a new one can open it (rebuild). The rest is
+        kept, so readers on other threads still see the last state until the new one replaces it."""
+        import gc
+
+        self.disconnect_all()                 # the graph holds the source block
+        self._keep.clear()
+        self._rtl = self._source = None
+        gc.collect()
 
     def gain_info(self) -> dict:
         return {"supported": self._rtl is not None, "mode": self.gain_mode, "gain": self.gain,

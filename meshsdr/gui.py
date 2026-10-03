@@ -270,38 +270,32 @@ class MonitorWindow(QtWidgets.QMainWindow):
         # ---- bottom: decoders | packets + details
         bottom = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderLabels(["decoder", "frames", "crc✗", "rssi", "snr"])
+        self.tree.setHeaderLabels(["decoder", "", "frames", "crc✗", "rssi", "snr"])
         self.tree.setColumnWidth(0, 200)
+        self.tree.setColumnWidth(1, 26)
+        self.tree.headerItem().setToolTip(1, "decoder settings")
         self.tree_items: dict[str, QtWidgets.QTreeWidgetItem] = {}
         self.proto_items: dict[str, QtWidgets.QTreeWidgetItem] = {}
-        for proto in PROTO_ORDER:
-            rxs = [rx for rx in core.cfg.receivers if rx.protocol == proto]
-            if not rxs:
-                continue
-            parent = QtWidgets.QTreeWidgetItem([PROTO_NAME[proto]])
-            # auto-tristate: the group box ticks/unticks all children and shows "partial"
-            parent.setFlags(parent.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable |
-                            QtCore.Qt.ItemFlag.ItemIsAutoTristate)
-            parent.setForeground(0, QtGui.QColor(*PROTOCOL_COLORS[proto]))
-            self.tree.addTopLevelItem(parent)
-            self.proto_items[proto] = parent
-            for rx in rxs:
-                it = QtWidgets.QTreeWidgetItem([rx.name, "0", "0", "", ""])
-                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                it.setCheckState(0, QtCore.Qt.CheckState.Checked if core.stats[rx.name].enabled
-                                 else QtCore.Qt.CheckState.Unchecked)
-                it.setData(0, QtCore.Qt.ItemDataRole.UserRole, rx.name)
-                parent.addChild(it)
-                self.tree_items[rx.name] = it
-        self.tree.expandAll()
         self._syncing = False
+        self._build_tree()
+        self.tree.itemClicked.connect(self._tree_clicked)
         self._syncing_gain = False
         self._apply_tree = QtCore.QTimer(self, singleShot=True)
         self._apply_tree.timeout.connect(self._apply_tree_now)
         self.tree.itemChanged.connect(self._tree_changed)
         self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
-        self.boxes[2] = _box("²decoders", BOX["decoders"], self.tree)
+        dec = QtWidgets.QWidget()
+        dlay = QtWidgets.QVBoxLayout(dec)
+        dlay.setContentsMargins(0, 0, 0, 0)
+        dlay.addWidget(self.tree)
+        add = QtWidgets.QPushButton("＋ Add decoder…")
+        add.setToolTip("Add a decoder (Meshtastic preset, MeshCore, LoRaWAN plan or channel, FSK listener); "
+                       "saved in decoders.jsonc")
+        add.clicked.connect(self._add_decoder)
+        add.setEnabled(hasattr(core, "decoder_add"))
+        dlay.addWidget(add)
+        self.boxes[2] = _box("²decoders", BOX["decoders"], dec)
         bottom.addWidget(self.boxes[2])
 
         right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -691,7 +685,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.markers = keep
         self.marker_scatter.setData([{"pos": (m["f"], (self.row_count - m["row"]) * self.row_dt),
                                       "brush": pg.mkBrush(m["color"])} for m in self.markers])
+        self._follow_bands()                             # before touching a band's items
         for b in self.core.bands:
+            if id(b) not in self.band_items:
+                continue
             hot = self.flash_until.get(id(b), 0) > now
             if self._band_hot.get(id(b)) != hot:         # redraw only on change
                 self._band_hot[id(b)] = hot
@@ -791,7 +788,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self._syncing = True
         try:
             for name, it in self.tree_items.items():
-                want = QtCore.Qt.CheckState.Checked if c.stats[name].enabled else QtCore.Qt.CheckState.Unchecked
+                st = c.stats.get(name)
+                if st is None:
+                    continue
+                want = QtCore.Qt.CheckState.Checked if st.enabled else QtCore.Qt.CheckState.Unchecked
                 if it.checkState(0) != want:
                     it.setCheckState(0, want)
         finally:
@@ -844,6 +844,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
 
     def _tick_slow(self):
         c = self.core
+        self._follow_receivers()
         self._follow_center()
         self._follow_bands()
         self._sync_shared()
@@ -852,11 +853,13 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self._sync_gain()
         self._show_adc()
         for name, it in self.tree_items.items():
-            st = c.stats[name]
-            it.setText(1, str(st.frames))
-            it.setText(2, str(st.crc_errors))
-            it.setText(3, "" if st.last_rssi is None else f"{st.last_rssi:.0f}")
-            it.setText(4, "" if st.last_snr is None else f"{st.last_snr:.1f}")
+            st = c.stats.get(name)
+            if st is None:
+                continue
+            it.setText(2, str(st.frames))
+            it.setText(3, str(st.crc_errors))
+            it.setText(4, "" if st.last_rssi is None else f"{st.last_rssi:.0f}")
+            it.setText(5, "" if st.last_snr is None else f"{st.last_snr:.1f}")
             out = name not in inr
             if it.data(0, QtCore.Qt.ItemDataRole.ToolTipRole) != ("outside the tuned window: idle" if out else None):
                 it.setToolTip(0, "outside the tuned window: idle" if out else None)
@@ -871,15 +874,93 @@ class MonitorWindow(QtWidgets.QMainWindow):
                             f"waterfall {self.settings.lines_per_second:g} lines/s, {self.settings.history_s:g} s   "
                             f"levels {self.floor:.0f}…{self.ceil:.0f} dB")
 
+    def _build_tree(self):
+        """(Re)populate the decoder tree from the current decoder set."""
+        core = self.core
+        self._syncing = True
+        try:
+            self.tree.clear()
+            self.tree_items.clear()
+            self.proto_items.clear()
+            for proto in PROTO_ORDER:
+                rxs = [rx for rx in core.cfg.receivers if rx.protocol == proto]
+                if not rxs:
+                    continue
+                parent = QtWidgets.QTreeWidgetItem([PROTO_NAME[proto]])
+                # auto-tristate: the group box ticks/unticks all children and shows "partial"
+                parent.setFlags(parent.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable |
+                                QtCore.Qt.ItemFlag.ItemIsAutoTristate)
+                parent.setForeground(0, QtGui.QColor(*PROTOCOL_COLORS[proto]))
+                self.tree.addTopLevelItem(parent)
+                self.proto_items[proto] = parent
+                for rx in rxs:
+                    it = QtWidgets.QTreeWidgetItem([rx.name, "⚙", "0", "0", "", ""])
+                    it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    st = core.stats.get(rx.name)
+                    it.setCheckState(0, QtCore.Qt.CheckState.Checked if st is None or st.enabled
+                                     else QtCore.Qt.CheckState.Unchecked)
+                    it.setData(0, QtCore.Qt.ItemDataRole.UserRole, rx.name)
+                    it.setToolTip(1, f"{rx.name} settings…")
+                    it.setTextAlignment(1, QtCore.Qt.AlignmentFlag.AlignCenter)
+                    gf = it.font(1)
+                    gf.setPointSizeF(gf.pointSizeF() * 1.35)
+                    it.setFont(1, gf)
+                    if getattr(rx, "origin", "config") == "added" or getattr(rx, "overridden", False):
+                        f = it.font(0)
+                        f.setItalic(True)
+                        it.setFont(0, f)
+                        it.setToolTip(0, "added from the UI" if rx.origin == "added" else "parameters changed in the UI")
+                    parent.addChild(it)
+                    self.tree_items[rx.name] = it
+            self.tree.expandAll()
+        finally:
+            self._syncing = False
+        self._receivers_version = getattr(core, "receivers_version", 0)
+
+    def _follow_receivers(self):
+        """Decoders were added, removed or changed (here or by another front-end)."""
+        if getattr(self.core, "receivers_version", 0) != self._receivers_version:
+            self._apply_tree.stop()
+            self._build_tree()
+
+    def _tree_clicked(self, item: QtWidgets.QTreeWidgetItem, col: int):
+        name = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if col == 1 and name:
+            self._decoder_settings(name)
+
+    def _decoder_settings(self, name: str):
+        if not hasattr(self.core, "decoder_update"):
+            return
+        from .gui_decoders import DecoderDialog
+
+        DecoderDialog(self, self.core, name).exec()
+        self._follow_receivers()
+
+    def _add_decoder(self):
+        from .gui_decoders import AddDecoderDialog
+
+        AddDecoderDialog(self, self.core).exec()
+        self._follow_receivers()
+
     def _tree_menu(self, pos):
         item = self.tree.itemAt(pos)
         name = item.data(0, QtCore.Qt.ItemDataRole.UserRole) if item else None
-        if not name or not hasattr(self.core, "channels"):
-            return
         menu = QtWidgets.QMenu(self)
-        act = menu.addAction(f"Channel settings… ({name})")
-        if menu.exec(self.tree.viewport().mapToGlobal(pos)) is act:
+        dec = chan = None
+        if name and hasattr(self.core, "decoder_update"):
+            dec = menu.addAction(f"⚙ Decoder settings… ({name})")
+        if name and hasattr(self.core, "channels"):
+            chan = menu.addAction(f"Channel settings… ({name})")
+        add = menu.addAction("＋ Add decoder…") if hasattr(self.core, "decoder_add") else None
+        act = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if act is None:
+            return
+        if act is dec:
+            self._decoder_settings(name)
+        elif act is chan:
             ChannelDialog(self, self.core, name).exec()
+        elif act is add:
+            self._add_decoder()
 
     def _tree_changed(self, item: QtWidgets.QTreeWidgetItem, col: int):
         """Receivers are enabled individually; group boxes just drive/reflect their children.

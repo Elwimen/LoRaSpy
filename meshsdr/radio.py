@@ -120,6 +120,9 @@ class ReceiverParams:
     protocol: str = "meshtastic"
     sync_word: int = MESHTASTIC_SYNC_WORD
     invert_iq: bool = False  # LoRaWAN downlinks
+    origin: str = "config"   # "config" (config.jsonc) or "added" (decoders.jsonc, from the UIs)
+    spec_index: int | None = None   # which decoders.jsonc "add" entry produced it
+    overridden: bool = False        # parameters changed in decoders.jsonc
 
     @property
     def symbol_time_ms(self) -> float:
@@ -144,10 +147,15 @@ def resolve_receiver(region_name: str, spec: dict) -> ReceiverParams:
     """
     Turn one `receivers[]` entry from the config into concrete radio parameters.
 
-    Accepted keys: preset, primary_channel, channel_num (1-based slot), frequency_hz,
+    Accepted keys: preset, region, primary_channel, channel_num (1-based slot), frequency_hz,
     frequency_offset_hz, bandwidth_hz, spreading_factor, coding_rate, name.
-    Explicit values override anything derived from the preset.
+    Explicit values override anything derived from the preset. "region" picks the slot plan of
+    another Meshtastic region than the config's (the default name then gets the region appended,
+    e.g. "LongFast US", so it can sit next to the local one).
     """
+    own_region = "region" in spec
+    if own_region:
+        region_name = str(spec["region"]).upper()
     preset = None
     if "preset" in spec:
         key = str(spec["preset"]).upper()
@@ -179,7 +187,9 @@ def resolve_receiver(region_name: str, spec: dict) -> ReceiverParams:
         span = f32(region.freq_end_mhz) - f32(region.freq_start_mhz)
         num_channels = int(floor(span / (f32(region.spacing_mhz) + f32(bw_khz) / f32(1000))))
         if num_channels < 1:
-            raise ValueError(f"Region {region_name} is too narrow for {bw_khz:g} kHz bandwidth")
+            fallback = " (Meshtastic nodes there fall back to LongFast)" if preset and bw_khz >= 499.5 else ""
+            raise ValueError(f"Region {region_name} ({region.freq_start_mhz:g}–{region.freq_end_mhz:g} MHz) is too "
+                             f"narrow for {bw_khz:g} kHz{fallback}: pick a wider region or set frequency_hz")
         # The slot is picked by hashing the *primary* channel name; an empty/default
         # name means the preset display name (e.g. "LongFast").
         primary = spec.get("primary_channel") or (preset.display_name if preset else "Custom")
@@ -193,6 +203,8 @@ def resolve_receiver(region_name: str, spec: dict) -> ReceiverParams:
 
     freq_hz += float(spec.get("frequency_offset_hz", 0))
     name = spec.get("name") or (preset.display_name if preset else f"SF{sf}BW{bw_khz:g}")
+    if own_region and not spec.get("name"):
+        name = f"{name} {region_name}"
     return ReceiverParams(name=name, frequency_hz=freq_hz, bw_hz=bw_hz, sf=int(sf), cr=int(cr), slot=slot)
 
 
@@ -296,8 +308,19 @@ TW_CHANNELS_HZ = [869.435e6 + 30e3 * i for i in range(7)]
 
 
 def resolve_trustedwireless(spec: dict) -> list[ReceiverParams]:
-    """{"protocol": "trustedwireless", "channels": [869.435, …] (MHz, optional)} → one
-    listener per hop channel. The payload is encrypted: frames are shown, not decrypted."""
-    chans = [float(f) * (1e6 if float(f) < 1e4 else 1) for f in spec.get("channels", [])] or TW_CHANNELS_HZ
+    """{"protocol": "trustedwireless"} → one listener per hop channel (869.435 + n·30 kHz).
+    Options: "offset_khz": shifts the whole set, e.g. -15 for the interleaved grid
+    869.420 + n·30 kHz that the same kind of network also uses (add a second entry to listen on
+    both); "channels": [MHz, …] for an explicit list (the offset applies to it too).
+    The payload is encrypted: frames are shown, not decrypted."""
+    try:
+        offset = float(spec.get("offset_khz", 0)) * 1e3
+    except (TypeError, ValueError):
+        raise ValueError(f"trustedwireless: offset_khz must be a number, got {spec.get('offset_khz')!r}") from None
+    base = [float(f) * (1e6 if float(f) < 1e4 else 1) for f in spec.get("channels", [])] or TW_CHANNELS_HZ
+    chans = [f + offset for f in base]
+    if not all(869.40e6 <= f <= 869.65e6 for f in chans):
+        raise ValueError("trustedwireless: channels must stay inside 869.40–869.65 MHz "
+                         f"(got {min(chans) / 1e6:.3f}–{max(chans) / 1e6:.3f} MHz)")
     return [ReceiverParams(name=f"TW {f / 1e6:.3f}", frequency_hz=f, bw_hz=30_000, sf=0, cr=0,
                            protocol="trustedwireless", sync_word=0) for f in chans]

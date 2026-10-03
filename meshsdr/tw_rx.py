@@ -43,6 +43,8 @@ def demodulate(seg: np.ndarray, fs: float) -> tuple[str, float]:
     if len(loud) < 10:
         return "", 0.0
     a, b = loud[0] + int(0.0003 * fs), loud[-1] - int(0.0003 * fs)
+    if b - a < 10:                       # a click (e.g. while retuning), not a burst
+        return "", 0.0
     f = f[a:b]
     pre = f[int(0.0005 * fs):int(0.0045 * fs)]
     cfo = float(np.median(pre)) if len(pre) else float(np.median(f))

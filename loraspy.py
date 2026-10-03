@@ -41,6 +41,7 @@ examples:
   loraspy.py gain 15                         change the running SDR's gain (no value: show gain + ADC level)
   loraspy.py tune 868.95M                    retune the running SDR (decoders stay on their channels)
   loraspy.py keys add channel name=X psk=random   add a channel (keys: list; live when running)
+  loraspy.py decoder add preset=LONG_SLOW      add a decoder (decoder: list; set/reset/remove)
   loraspy.py listen --pcap cap.pcapng --jsonl cap.jsonl
   loraspy.py listen --iq-file cap.cu8 --iq-center 869.775e6 --iq-rate 2e6
 
@@ -162,6 +163,36 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("receiver", nargs="?", help="any decoder on the channel, e.g. LongFast or 'LW 868.1 SF7'")
     cp.add_argument("freq", nargs="?", help="new centre: 869.5M, 869500k, MHz …; 'reset' = configured value")
     add_share_args(cp, attach=False)
+
+    # ---- decoder
+    dp = sub.add_parser("decoder", formatter_class=fmt,
+                        help="list, add, change or remove decoders (decoders.jsonc; live when running)",
+                        description="Decoders added or changed here go to decoders.jsonc next to the config "
+                                    "(config.jsonc itself is never rewritten). With a LoRaSpy running they "
+                                    "apply at once: a frequency change of a decoder with a channel filter of "
+                                    "its own is live, anything else restarts the decoders (≈1–2 s).",
+                        epilog="""\
+examples:
+  loraspy.py decoder                                list decoders (+ added, * changed)
+  loraspy.py decoder add preset=LONG_SLOW name=LS2  a Meshtastic preset (on its default slot)
+  loraspy.py decoder add preset=LONG_FAST channel_num=3 name=LF-slot3
+  loraspy.py decoder add preset=SHORT_TURBO region=US   another region's slot plan → "ShortTurbo US"
+  loraspy.py decoder add protocol=meshcore preset=EU_UK_NARROW name=MC2
+  loraspy.py decoder add protocol=meshtastic frequency_hz=869.4M bandwidth_hz=125000 \\
+                          spreading_factor=10 coding_rate=5 sync_word=0x12 name=Custom
+  loraspy.py decoder add protocol=lorawan frequency_hz=868.8M spreading_factors=[9,12]
+  loraspy.py decoder add protocol=trustedwireless offset_khz=-15 name=B
+  loraspy.py decoder set LongFast sf=12 frequency=869.5M    change parameters
+  loraspy.py decoder reset LongFast                 back to its config.jsonc parameters
+  loraspy.py decoder remove LF-slot3                remove an added decoder (and its siblings)
+fields for 'add': any config.jsonc receiver key (preset, protocol, frequency_hz, bandwidth_hz,
+  spreading_factor, coding_rate, channel_num, primary_channel, region, plan, offset_khz, name …) plus
+  sync_word and invert_iq. 'set' takes frequency (or frequency_hz), bw_hz, sf, cr, sync_word, invert_iq.
+""")
+    dp.add_argument("action", nargs="?", default="list", choices=["list", "add", "set", "reset", "remove"])
+    dp.add_argument("rest", nargs="*", metavar="NAME|field=value",
+                    help="set/reset/remove: the decoder name first; add/set: field=value pairs")
+    add_share_args(dp, attach=False)
 
     # ---- keys
     kp = sub.add_parser("keys", formatter_class=fmt,
@@ -648,6 +679,78 @@ def cmd_channel(args) -> int:
         core.stop()
 
 
+def _field_value(text: str):
+    """field=value on the command line: JSON when it parses (numbers, true, [9,12]), else a string."""
+    import json
+
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def cmd_decoder(args) -> int:
+    from meshsdr import share
+    from meshsdr.decoderstore import OfflineDecoders
+
+    path = args.socket or share.default_socket_path()
+    live = share.server_alive(path)
+    if live:
+        from meshsdr.remote import RemoteCore
+        core = RemoteCore(path, "decoder-cli")
+        core.start()
+    else:
+        core = OfflineDecoders(args.config)
+    try:
+        rest = list(args.rest)
+        name = None
+        if args.action in ("set", "reset", "remove"):
+            if not rest or "=" in rest[0]:
+                raise ValueError(f"'{args.action}' needs the decoder name first (see: loraspy.py decoder)")
+            name = rest.pop(0)
+        fields = {}
+        for kv in rest:
+            k, sep, v = kv.partition("=")
+            if not sep:
+                raise ValueError(f"expected field=value, got '{kv}'")
+            fields[k.strip()] = _field_value(v)
+        if args.action == "list":
+            for d in core.decoder_list():
+                mark = "+" if d["origin"] == "added" else "*" if d["overridden"] else " "
+                lora = "" if d["protocol"] == "trustedwireless" else \
+                    f"{d['bw_hz'] / 1e3:5g} kHz SF{d['sf']:<2} 4/{d['cr']} sync 0x{d['sync_word']:02X}" + \
+                    (" IQ-inv" if d["invert_iq"] else "")
+                print(f"{mark} {d['name']:<22} {d['protocol']:<15} {d['frequency_hz'] / 1e6:10.4f} MHz  {lora}")
+            print("\n+ added (decoders.jsonc)   * parameters changed (decoders.jsonc)"
+                  + ("" if live else "   — no LoRaSpy running: changes apply at its next start"))
+        elif args.action == "add":
+            for k in ("frequency_hz",):
+                if isinstance(fields.get(k), str):
+                    fields[k] = parse_hz(fields[k])
+            names = core.decoder_add(fields)
+            print(f"added {', '.join(names)}")
+        elif args.action == "set":
+            params = {}
+            for k, v in fields.items():
+                k = {"frequency": "frequency_hz", "freq": "frequency_hz", "bw": "bw_hz", "bandwidth_hz": "bw_hz",
+                     "spreading_factor": "sf", "coding_rate": "cr"}.get(k, k)
+                params[k] = parse_hz(str(v)) if k == "frequency_hz" else v
+            if not params:
+                raise ValueError("nothing to set: give field=value pairs")
+            print(f"{name}: {core.decoder_update(name, params)}")
+        elif args.action == "reset":
+            print(f"{name}: {core.decoder_reset(name)}")
+        elif args.action == "remove":
+            print(f"removed {', '.join(core.decoder_remove(name))}")
+        return 0
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if live:
+            core.stop()
+
+
 def cmd_keys(args) -> int:
     from meshsdr import keystore, share
 
@@ -895,6 +998,8 @@ def main() -> int:
         return cmd_gain(args)
     if args.command == "keys":
         return cmd_keys(args)
+    if args.command == "decoder":
+        return cmd_decoder(args)
     if args.command == "tune":
         return cmd_tune(args)
     if args.command == "channel":

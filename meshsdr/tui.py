@@ -261,7 +261,7 @@ class Stats(Static):
         for proto, rgb in PROTOCOL_COLORS.items():
             rxs = [r.name for r in c.cfg.receivers if r.protocol == proto]
             if rxs:
-                on = any(c.stats[n].enabled for n in rxs)
+                on = any(n in c.stats and c.stats[n].enabled for n in rxs)
                 t.append(f"{PROTO_SHORT[proto]} {c.per_protocol.get(proto, 0)}  ",
                          style=_hex(rgb) if on else BTOP["inactive"])
         t.append(f"CRC✗ {c.totals['crc_err']}  ", style=BTOP["hi"] if c.totals["crc_err"] else BTOP["graph_text"])
@@ -337,15 +337,23 @@ class MonitorTUI(App):
         dec = self.query_one("#decoders", DataTable)
         dec.border_title = "²decoders"
         dec.add_columns(" ", "receiver", "frm", "crc✗", "rssi", "snr", "ago")
-        order = {"meshtastic": 0, "meshcore": 1, "lorawan": 2, "trustedwireless": 3}
-        for rx in sorted(self.core.cfg.receivers, key=lambda r: order.get(r.protocol, 9)):
-            dec.add_row(*self._decoder_row(rx.name), key=rx.name)
+        self._fill_decoders()
         pk = self.query_one("#packets", DataTable)
         pk.border_title = "³packets"
         pk.add_columns("time", "  ", "receiver", "kind", "from", "to", "text")
         self.query_one("#details-box").border_title = "⁴details"
         self.set_interval(1 / 15, self._fast)
         self.set_interval(0.5, self._slow)
+
+    def _fill_decoders(self):
+        """(Re)build the decoder rows; decoders can be added/removed from the GUI or `loraspy.py decoder`."""
+        dec = self.query_one("#decoders", DataTable)
+        dec.clear()
+        order = {"meshtastic": 0, "meshcore": 1, "lorawan": 2, "trustedwireless": 3}
+        for rx in sorted(self.core.cfg.receivers, key=lambda r: order.get(r.protocol, 9)):
+            if rx.name in self.core.stats:
+                dec.add_row(*self._decoder_row(rx.name), key=rx.name)
+        self._receivers_version = getattr(self.core, "receivers_version", 0)
 
     def _decoder_row(self, name):
         rx = next(r for r in self.core.cfg.receivers if r.name == name)
@@ -373,7 +381,11 @@ class MonitorTUI(App):
     def _slow(self):
         self.query_one("#stats", Stats).tick()
         dec = self.query_one("#decoders", DataTable)
+        if getattr(self.core, "receivers_version", 0) != self._receivers_version:
+            self._fill_decoders()
         for rx in self.core.cfg.receivers:
+            if rx.name not in dec.rows:
+                continue
             row = self._decoder_row(rx.name)
             for col, val in zip(dec.columns.keys(), row):
                 dec.update_cell(rx.name, col, val)

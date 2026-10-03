@@ -73,6 +73,8 @@ class RemoteCore:
         self._req = 0
         self._waiting: dict[int, list] = {}    # request id → [Event, reply]
         self.keys_version = 0
+        self.receivers_version = 0
+        self.on_rebuild = []                    # fn(), after the server's decoder set changed
         self._connect()                         # raises OSError / ConnectionError when nobody serves
 
     # ------------------------------------------------------------------ connection
@@ -105,7 +107,9 @@ class RemoteCore:
         self.center_hz = h["center_hz"]
         self.sample_rate = h["sample_rate"]
         self.started = h["started"]
-        self.cfg = SimpleNamespace(receivers=[ReceiverParams(**d) for d in h["receivers"]])
+        self.cfg = SimpleNamespace(receivers=[ReceiverParams(**d) for d in h["receivers"]],
+                                   region=h.get("region", "EU_868"))
+        self.receivers_version = h.get("receivers_version", 0)
         self.bands = [Band(**d) for d in h["bands"]]
         self.regulatory = [Band(**d) for d in h["regulatory"]]
         if not hasattr(self, "stats"):
@@ -232,6 +236,15 @@ class RemoteCore:
             if slot is not None:
                 slot[1] = m
                 slot[0].set()
+        elif t == "reconfigured":
+            names = [d["name"] for d in m["receivers"]]
+            self.stats = {n: self.stats[n] for n in names if n in self.stats}   # new dict: the UIs rebuild
+            self._apply_hello(m)
+            for cb in self.on_rebuild:
+                try:
+                    cb()
+                except Exception:
+                    log.exception("rebuild listener failed")
         elif t == "keys_changed":
             self.keys_version += 1
         elif t == "bye":
@@ -283,6 +296,22 @@ class RemoteCore:
 
     def recordings(self) -> list[dict]:
         return self._request({"cmd": "record", "op": "status"})["recordings"]
+
+    # decoder set: edited in the server's decoders.jsonc (same API as MonitorCore)
+    def decoder_list(self) -> list[dict]:
+        return self._request({"cmd": "decoder", "op": "list"})["decoders"]
+
+    def decoder_add(self, spec: dict) -> list[str]:
+        return self._request({"cmd": "decoder", "op": "add", "spec": spec}, timeout=30)["result"]
+
+    def decoder_update(self, name: str, params: dict) -> str:
+        return self._request({"cmd": "decoder", "op": "update", "name": name, "params": params}, timeout=30)["result"]
+
+    def decoder_reset(self, name: str) -> str:
+        return self._request({"cmd": "decoder", "op": "reset", "name": name}, timeout=30)["result"]
+
+    def decoder_remove(self, name: str) -> list[str]:
+        return self._request({"cmd": "decoder", "op": "remove", "name": name}, timeout=30)["result"]
 
     def channels(self) -> list[dict]:
         return list(self._channels)

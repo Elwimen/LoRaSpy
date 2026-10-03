@@ -47,6 +47,8 @@
   // MeshCore (sync word 0x12):
   //   { "protocol": "meshcore", "preset": "EU_UK_NARROW" }   869.618 MHz, 62.5 kHz, SF8 (firmware default)
   //   { "protocol": "meshcore", "frequency_hz": ..., "bandwidth_hz": ..., "spreading_factor": ... }
+  // Decoders can also be added or changed at runtime (GUI ⚙ / ＋ Add decoder…, `loraspy.py decoder`);
+  // those are stored in decoders.jsonc next to this file and merged with the list below.
   "receivers": [
     { "preset": "LONG_FAST" },
     // { "preset": "MEDIUM_SLOW" },   // same frequency as LongFast on EU_868, different SF
@@ -54,12 +56,17 @@
     // chosen by the primary channel name:
     // { "preset": "SHORT_FAST" }, { "preset": "SHORT_SLOW" }, { "preset": "MEDIUM_FAST" },
     // { "preset": "LONG_MODERATE", "primary_channel": "LongFast" }, { "preset": "LONG_SLOW", "primary_channel": "LongFast" },
+    // Another region's slot plan (name gets the region appended: "ShortTurbo US"); the 500 kHz
+    // turbo presets don't fit EU_868 (869.40–869.65 MHz), nodes there fall back to LongFast:
+    // { "preset": "SHORT_TURBO", "region": "US" },
     // { "protocol": "lorawan", "plan": "EU868" },
     // { "protocol": "meshcore", "preset": "EU_UK_NARROW" },
     // Encrypted 2-FSK frequency-hopping telemetry networks in 869.40–869.65 MHz (characteristics of
     // Phoenix Contact "Trusted Wireless": 30 kHz channels, ~10 kBd). Shows frames, stations (by level
-    // and header address field) and timing; the payload is encrypted. Optional "channels": [MHz, …].
+    // and header address field) and timing; the payload is encrypted. Optional "channels": [MHz, …];
+    // "offset_khz" shifts the set: links also run on the interleaved grid 869.420 + n·30 kHz.
     // { "protocol": "trustedwireless" },
+    // { "protocol": "trustedwireless", "offset_khz": -15 },
   ],
 
   // ---------------------------------------------------------------- Meshtastic keys

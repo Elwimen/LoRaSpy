@@ -105,6 +105,11 @@ class MonitorCore:
 
         from .flowgraph import MonitorFlowgraph
 
+        self._fg_args = dict(iq_file=iq_file, iq_format=iq_format, iq_center_hz=iq_center_hz,
+                             soft_decoding=soft_decoding, realtime=realtime, iq_loop=iq_loop)
+        self._rebuilding = False
+        self.receivers_version = 0
+        self.on_rebuild = []  # fn(), after the decoder set changed (flowgraph rebuilt)
         self.tb = MonitorFlowgraph(cfg.receivers, cfg.sdr, self._frames.put, iq_file=iq_file, iq_format=iq_format,
                                    iq_center_hz=iq_center_hz, soft_decoding=soft_decoding,
                                    on_spectrum=self._on_spectrum, fft_size=fft_size,
@@ -143,6 +148,9 @@ class MonitorCore:
             return
         last, since = None, time.time()
         while not self._stop.wait(0.5):
+            if self._rebuilding:
+                last, since = None, time.time()
+                continue
             try:
                 n = self.tb.spectrum.nitems_read(0)   # the tap sees every source sample
             except Exception:
@@ -166,7 +174,10 @@ class MonitorCore:
         """Sets `finished` when a non-looping IQ file has been played to the end."""
         if not self._finite:
             return
-        self.tb.wait()
+        tb = self.tb
+        tb.wait()
+        if self.tb is not tb:                  # replaced by a rebuild, not finished
+            return
         if not self._stop.is_set():
             log.info("source finished")
             self.finished.set()
@@ -303,6 +314,151 @@ class MonitorCore:
             self.bands_version += 1
         self._changed()
         return names
+
+    # ------------------------------------------------------------------ decoder set (decoders.jsonc)
+
+    def _decoder_store(self):
+        from .decoderstore import DecoderStore
+
+        if self.cfg.source_path is None:
+            raise ValueError("no config file: decoders can't be edited")
+        return DecoderStore(self.cfg.source_path)
+
+    def decoder_list(self) -> list[dict]:
+        """Every decoder with its parameters, origin and which channel it shares."""
+        chans = {n: c for c in self.channels() for n in c["receivers"]}
+        out = []
+        for rx in self.cfg.receivers:
+            ch = chans.get(rx.name, {})
+            out.append({"name": rx.name, "protocol": rx.protocol, "frequency_hz": rx.frequency_hz, "bw_hz": rx.bw_hz,
+                        "sf": rx.sf, "cr": rx.cr, "sync_word": rx.sync_word, "invert_iq": rx.invert_iq,
+                        "origin": rx.origin, "spec_index": rx.spec_index, "overridden": rx.overridden,
+                        "channel_mates": [n for n in ch.get("receivers", []) if n != rx.name],
+                        "spec_mates": [r.name for r in self.cfg.receivers if rx.origin == "added"
+                                       and r.spec_index == rx.spec_index and r.name != rx.name]})
+        return out
+
+    def decoder_add(self, spec: dict) -> list[str]:
+        names = self._decoder_store().add(spec)
+        self.rebuild()
+        return names
+
+    def decoder_remove(self, name: str) -> list[str]:
+        rx = next((r for r in self.cfg.receivers if r.name == name), None)
+        if rx is None or rx.origin != "added":
+            raise ValueError(f"'{name}' comes from config.jsonc: untick it, or remove it there")
+        names = self._decoder_store().remove(rx.spec_index)
+        self.rebuild()
+        return names
+
+    def decoder_update(self, name: str, params: dict) -> str:
+        """Change a decoder's parameters (persisted in decoders.jsonc). A frequency change of a
+        decoder that has its channel filter to itself is applied live; anything else (SF, BW,
+        CR, sync word, IQ, or moving one decoder off a shared channel) rebuilds the flowgraph."""
+        rx = next((r for r in self.cfg.receivers if r.name == name), None)
+        if rx is None:
+            raise ValueError(f"unknown decoder '{name}'")
+        params = {k: v for k, v in params.items() if getattr(rx, k, None) != v}
+        if not params:
+            return "unchanged"
+        self._decoder_store().set_override(name, params)
+        mates = next((c["receivers"] for c in self.channels() if name in c["receivers"]), [name])
+        if set(params) == {"frequency_hz"} and mates == [name]:
+            try:
+                self.set_channel_frequency(name, float(params["frequency_hz"]))
+                rx.overridden = True
+                return "applied live"
+            except ValueError:
+                pass                                   # outside the live range: rebuild instead
+        self.rebuild()
+        return "decoders restarted"
+
+    def decoder_reset(self, name: str) -> str:
+        self._decoder_store().reset(name)
+        self.rebuild()
+        return "decoders restarted"
+
+    def rebuild(self):
+        """Restart the radio flowgraph with the current decoder set (config.jsonc + decoders.jsonc).
+        Keeps tuning, gain, FFT, spectrum, enabled/disabled choices, statistics and history;
+        about a second of samples is lost."""
+        import dataclasses
+        import gc
+
+        from .config import ConfigError, load_config
+        from .flowgraph import MonitorFlowgraph
+
+        try:
+            fresh = load_config(self.cfg.source_path)
+        except ConfigError as e:
+            raise ValueError(str(e)) from e
+        with self._reconf_lock:
+            self._rebuilding = True
+            try:
+                old = self.tb
+                enabled_before, known = self.enabled, set(self.stats)
+                g, center = old.gain_info(), old.center_hz
+                spectrum_on = old.spectrum.active
+                old.iq_tap.stop_all("stopped: the decoders were reconfigured")
+                with old._topo_lock:
+                    old.stop()
+                    old.wait()
+                    old.running = False
+                    old.close()                       # release the SDR before opening it again
+                old = None
+                sdr = self.cfg.sdr
+                if g.get("supported"):
+                    sdr = dataclasses.replace(sdr, gain="auto" if g["mode"] == "auto" else g["gain"])
+                args = self._fg_args
+
+                def build(receivers):
+                    for attempt in range(10):         # libusb may need a moment to let go
+                        try:
+                            return MonitorFlowgraph(receivers, sdr, self._frames.put, on_spectrum=self._on_spectrum,
+                                                    fft_size=self.fft_size, spectrum_window=self.window,
+                                                    center_hz=None if args["iq_file"] else center, **args)
+                        except RuntimeError:
+                            if attempt == 9:
+                                raise
+                            gc.collect()
+                            time.sleep(0.3)
+
+                try:
+                    tb = build(fresh.receivers)
+                except Exception:
+                    log.exception("the new decoder set failed to start — restoring the previous one")
+                    tb = build(self.cfg.receivers)
+                    fresh = self.cfg
+                names = {r.name for r in fresh.receivers}
+                enabled = (enabled_before & names) | (names - known)
+                tb.set_enabled(enabled)
+                tb.spectrum.active = spectrum_on
+                self.cfg.receivers = fresh.receivers
+                stats = {r.name: self.stats.get(r.name) or ReceiverStats() for r in fresh.receivers}
+                for n, st in stats.items():
+                    st.enabled = n in enabled
+                self.stats = stats                     # swapped whole: readers iterate it unlocked
+                for r in fresh.receivers:
+                    self.protocol_enabled.setdefault(r.protocol, True)
+                self.bands = receiver_bands(fresh.receivers)
+                self.bands_version += 1
+                self.receivers_version += 1
+                with tb._topo_lock:
+                    tb.running = True
+                    tb.start()
+                self.tb = tb
+                self.center_hz = tb.center_hz
+            finally:
+                self._rebuilding = False
+        if self._finite:
+            threading.Thread(target=self._wait_tb, name="tb-wait", daemon=True).start()
+        log.info("decoders reconfigured: %d receivers", len(self.cfg.receivers))
+        for cb in self.on_rebuild:
+            try:
+                cb()
+            except Exception:
+                log.exception("rebuild listener failed")
+        self._changed()
 
     @property
     def tunable(self) -> bool:

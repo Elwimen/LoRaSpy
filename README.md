@@ -160,6 +160,38 @@ neither shown nor logged.
 
 The dial uses the Antonio font (SIL Open Font License, `meshsdr/fonts/`).
 
+## Decoder settings and adding decoders
+
+- **⚙ next to each decoder** (GUI decoder list, or right click → *Decoder settings…*): its
+  frequency (dial), bandwidth, spreading factor, coding rate, sync word and inverted IQ. A
+  frequency change of a decoder that has its channel filter to itself is applied live;
+  anything else (or moving one decoder off a shared filter) restarts the decoders, which takes
+  1–2 s and keeps tuning, gain, FFT, enabled/disabled choices, statistics and the packet
+  history. *Undo changes* returns to the `config.jsonc` parameters.
+- **＋ Add decoder…** (below the decoder list): a Meshtastic preset (optionally on another
+  slot or frequency, or with another region's slot plan — US, ANZ, JP, … — all nine presets
+  including ShortTurbo/LongTurbo, which don't fit EU_868's 250 kHz), MeshCore, a LoRaWAN plan or single channel, or another Trusted Wireless
+  grid (offset). A preview lists the decoders it creates; names must be unique (a name given
+  for a plan or channel set becomes a prefix). Added decoders show in italics and can be
+  removed again from their ⚙ dialog; decoders from `config.jsonc` can only be unticked.
+- From the command line, live when a LoRaSpy runs, otherwise saved for its next start:
+  ```bash
+  ./loraspy.py decoder                                   # list (+ added, * changed)
+  ./loraspy.py decoder add preset=LONG_SLOW name=LS2
+  ./loraspy.py decoder add preset=SHORT_TURBO region=US      # → "ShortTurbo US", 926.75 MHz
+  ./loraspy.py decoder add protocol=trustedwireless offset_khz=-15 name=B
+  ./loraspy.py decoder set LS2 sf=10 frequency=869.45M
+  ./loraspy.py decoder reset LongFast
+  ./loraspy.py decoder remove LS2
+  ```
+- Everything is stored in `decoders.jsonc` next to `config.jsonc` (gitignored; `"add"` =
+  extra receiver specs, `"override"` = changed parameters per decoder) and merged at load, so
+  `config.jsonc` itself is never rewritten. Every change is validated by loading the merged
+  configuration first. Attached front-ends rebuild their decoder lists automatically.
+- The tuner is planned around the `config.jsonc` decoders only; an added decoder outside the
+  2 MHz window (e.g. another region's) idles until you tune there with the dial or
+  `loraspy.py tune 926.6M`.
+
 ## Gain and clipping
 
 The RTL-SDR's ADC has 8 bits. A strong nearby transmitter (a node on the same desk) at high
@@ -257,8 +289,14 @@ listener with a receiver entry:
 
 ```jsonc
 { "protocol": "trustedwireless" }                       // the 7 channels 869.435 … 869.615 MHz
+{ "protocol": "trustedwireless", "offset_khz": -15 }    // + the interleaved grid 869.420 … 869.600 MHz
 { "protocol": "trustedwireless", "channels": [869.435, 869.465] }   // or your own list
 ```
+
+Networks of this kind use more than one channel set: a second link was seen on the grid
+offset by half a channel (869.420 + n·30 kHz), with header byte 6 consistently 0x20 lower
+than on the first grid. Add an entry with `"offset_khz": -15` to listen on both; channels
+15 kHz apart don't produce duplicate frames.
 
 Each hop channel gets a narrow C++ channel filter and a small 2-FSK demodulator (energy at
 ±deviation per symbol, symbol clock fitted to the zero crossings, sync-word lock). The payload
@@ -463,6 +501,11 @@ For each protocol among the config's receivers, the simulator generates these pa
 
 It writes the keys needed to decrypt them (a Meshtastic PKI key, a LoRaWAN session, a MeshCore
 identity) into `sim.jsonc`.
+
+## Ideas for later
+
+Not implemented yet, possible future decoders on the same shared SDR: FM and AM audio,
+DAB+, CW/Morse, PSK31, FT4 and FT8.
 
 ## License
 

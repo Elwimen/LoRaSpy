@@ -155,6 +155,7 @@ class Server:
         self.core.callbacks.append(self._on_event)
         self.core.on_change.append(self._on_change)
         self.core.on_keys.append(self._on_keys)
+        self.core.on_rebuild.append(self._on_rebuild)
         threading.Thread(target=self._accept, name="share-accept", daemon=True).start()
         threading.Thread(target=self._stats_loop, name="share-stats", daemon=True).start()
         log.info("sharing on %s", self.path)
@@ -206,7 +207,8 @@ class Server:
         core = self.core
         return {"type": "hello", "version": share.PROTOCOL_VERSION, "pid": os.getpid(), "source": self.source,
                 "center_hz": core.center_hz, "sample_rate": core.sample_rate, "started": core.started,
-                "receivers": [asdict(rx) for rx in core.cfg.receivers],
+                "receivers": [asdict(rx) for rx in core.cfg.receivers], "receivers_version": core.receivers_version,
+                "region": core.cfg.region,
                 "bands": [asdict(b) for b in core.bands], "regulatory": [asdict(b) for b in core.regulatory],
                 **self._config(), **self._stats()}
 
@@ -255,6 +257,30 @@ class Server:
             if op != "list":
                 log.info("%s: keys %s %s", c.name, op, msg.get("kind"))
             self._reply(c, msg, ok=True, entries=core.keys_list())
+        except (ValueError, KeyError, TypeError, OSError) as e:
+            self._reply(c, msg, ok=False, error=str(e))
+
+    def _on_rebuild(self):
+        """The decoder set changed: clients rebuild their receiver lists from a fresh hello."""
+        self._broadcast(share.pack_json({**self._hello(), "type": "reconfigured"}))
+
+    def _decoder_command(self, c: _Client, msg: dict):
+        core, op = self.core, msg.get("op", "list")
+        try:
+            result = None
+            if op == "add":
+                result = core.decoder_add(msg.get("spec") or {})
+            elif op == "update":
+                result = core.decoder_update(str(msg["name"]), msg.get("params") or {})
+            elif op == "reset":
+                result = core.decoder_reset(str(msg["name"]))
+            elif op == "remove":
+                result = core.decoder_remove(str(msg["name"]))
+            elif op != "list":
+                raise ValueError(f"unknown decoder operation '{op}'")
+            if op != "list":
+                log.info("%s: decoder %s %s", c.name, op, msg.get("name") or (msg.get("spec") or {}).get("name", ""))
+            self._reply(c, msg, ok=True, result=result, decoders=core.decoder_list())
         except (ValueError, KeyError, TypeError, OSError) as e:
             self._reply(c, msg, ok=False, error=str(e))
 
@@ -324,6 +350,8 @@ class Server:
                 self._reply(c, msg, ok=False, error=str(e))
         elif cmd == "keys":
             self._keys_command(c, msg)
+        elif cmd == "decoder":
+            self._decoder_command(c, msg)
         elif cmd == "channel":
             try:
                 names = self.core.set_channel_frequency(str(msg.get("receiver")), float(msg.get("hz")))

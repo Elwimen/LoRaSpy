@@ -32,3 +32,5 @@ nodes_meshcore.json
 
 # IQ recordings made with 'loraspy.py record'
 recordings/
+decoders.jsonc
+.decoders.*.tmp
