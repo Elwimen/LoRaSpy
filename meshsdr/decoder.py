@@ -40,6 +40,9 @@ class RxFrame:
     has_crc: bool = True       # False: frame was sent without a payload CRC (LoRaWAN downlink)
     invert_iq: bool = False
     clipped: bool = False      # the SDR's ADC clipped during the frame: lower the gain
+    bits: str = ""             # FSK receivers: the demodulated bits after the sync word
+    freq_offset_hz: float | None = None
+    duration_ms: float | None = None
     timestamp: float = field(default_factory=time.time)
 
 

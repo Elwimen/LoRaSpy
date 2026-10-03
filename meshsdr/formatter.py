@@ -83,8 +83,8 @@ class Formatter:
     def wants(self, pkt) -> bool:
         if not pkt.frame.crc_ok:
             return self.show_crc_errors
-        if pkt.protocol == "lorawan":
-            return True  # headers are always readable; payload decryption is optional
+        if pkt.protocol in ("lorawan", "trustedwireless"):
+            return True  # headers are always readable; payload decryption is optional / impossible
         if not pkt.decrypted:
             return self.show_undecrypted
         return True
@@ -97,21 +97,23 @@ class Formatter:
         ts = datetime.fromtimestamp(f.timestamp).strftime("%Y-%m-%d %H:%M:%S")
         snr = signal_text(f)
         snr = f"  {snr}" if snr else ""
-        proto = self.c(BOLD, {"meshtastic": "Meshtastic", "lorawan": "LoRaWAN", "meshcore": "MeshCore"}[pkt.protocol])
+        proto = self.c(BOLD, {"meshtastic": "Meshtastic", "lorawan": "LoRaWAN", "meshcore": "MeshCore",
+                              "trustedwireless": "Trusted Wireless (2-FSK)"}[pkt.protocol])
         iq = ", inverted IQ" if f.invert_iq else ""
-        lines.append(f"{proto}  {ts}   Receiver: {f.receiver} "
-                     f"({f.frequency_hz / 1e6:.4f} MHz, SF{f.sf}/{f.bw_hz / 1e3:g}k{iq}){snr}")
+        mod = "2-FSK ~10 kBd" if pkt.protocol == "trustedwireless" else f"SF{f.sf}/{f.bw_hz / 1e3:g}k{iq}"
+        lines.append(f"{proto}  {ts}   Receiver: {f.receiver} ({f.frequency_hz / 1e6:.4f} MHz, {mod}){snr}")
         if not f.crc_ok:
             lines.append(self.c(RED, f"CRC ERROR — {len(f.data)} bytes, contents unreliable"))
-        elif not f.has_crc:
+        elif not f.has_crc and pkt.protocol != "trustedwireless":   # its CRC is inside the encryption
             lines.append(self.c(DIM, "No payload CRC (normal for LoRaWAN downlinks) — contents unverified"))
 
         body, hex_extra = {"meshtastic": self._meshtastic, "lorawan": self._lorawan,
-                           "meshcore": self._meshcore}[pkt.protocol](pkt)
+                           "meshcore": self._meshcore, "trustedwireless": self._tw}[pkt.protocol](pkt)
         lines += body
         if self.fmt in ("hex", "hextext"):
             lines.append("─" * WIDTH)
-            lines.append(f"LoRa frame ({len(f.data)} bytes):")
+            lines.append(f"{'Bits after the sync word, packed' if pkt.protocol == 'trustedwireless' else 'LoRa frame'} "
+                         f"({len(f.data)} bytes):")
             lines.append(hex_dump(f.data, use_color=self.colored))
             for title, data in hex_extra:
                 lines.append("─" * WIDTH)
@@ -201,6 +203,23 @@ class Formatter:
                 lines.append(f"🔒 FRMPayload {len(pkt.frm_payload)} bytes (encrypted; add a session under lorawan.sessions)")
         extra = [("FRMPayload decrypted", pkt.plaintext)] if pkt.plaintext else []
         return lines, extra
+
+    def _tw(self, pkt):
+        f = pkt.frame
+        extra = []
+        if f.duration_ms is not None:
+            extra.append(f"{f.duration_ms:.0f} ms")
+        if f.freq_offset_hz is not None:
+            extra.append(f"carrier {f.freq_offset_hz / 1e3:+.1f} kHz")
+        lines = [f"Station: {self.c(BOLD, pkt.station)} (by received level)   Address field: {pkt.addr or '—'}   "
+                 f"Role: {pkt.role}   "
+                 f"Exchange #{pkt.exchange}   Size: {pkt.kind}, {pkt.nbits} bits after sync"
+                 + (f"   ({', '.join(extra)})" if extra else ""),
+                 "Header: " + " ".join(f"{b:02x}" for b in pkt.header)]
+        if self.fmt in ("text", "hextext"):
+            lines.append(self.c(DIM, "Payload is encrypted (AES-128 per the radio specification): not decodable. "
+                                     "Header bytes 6–7 (address field) followed the station in long frames."))
+        return lines, []
 
     def _meshcore(self, pkt):
         lines = []
@@ -389,6 +408,12 @@ class Formatter:
                         "decoded": pkt.decoded,
                         "duplicate": pkt.duplicate, "error": pkt.error})
             return json.dumps(rec, ensure_ascii=False)
+        if pkt.protocol == "trustedwireless":
+            rec.update({"type": pkt.kind, "station": pkt.station, "addr": pkt.addr, "role": pkt.role,
+                        "exchange": pkt.exchange,
+                        "nbits": pkt.nbits, "bits": f.bits, "header": pkt.header.hex(),
+                        "duration_ms": f.duration_ms, "freq_offset_hz": f.freq_offset_hz, "decrypted": False})
+            return json.dumps(rec, ensure_ascii=False)
         if pkt.protocol == "meshcore":
             rec.update({"type": pkt.kind, "route": pkt.route, "path": [h.hex() for h in pkt.path],
                         "channel": pkt.channel, "identity": pkt.identity, "decrypted": pkt.decrypted,
@@ -475,6 +500,12 @@ def summarize(pkt, node_db: NodeDB | None = None) -> dict:
             out["text"] = pkt.plaintext.hex()
         elif pkt.dev_addr is not None:
             out["text"] = f"FCnt {pkt.fcnt} FPort {pkt.fport} 🔒 {len(pkt.frm_payload)} B ({pkt.network})"
+        return out
+    if pkt.protocol == "trustedwireless":
+        out["kind"] = f"TW {pkt.kind}"
+        out["src"], out["dst"] = f"{pkt.station} · id {pkt.addr}" if pkt.addr else pkt.station, pkt.role
+        out["text"] = f"🔒 {pkt.nbits} bits · hdr {pkt.header[:6].hex()}…"
+        out["ok"] = True
         return out
     if pkt.protocol == "meshcore":
         fl = pkt.fields

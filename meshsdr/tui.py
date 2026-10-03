@@ -37,7 +37,7 @@ BTOP = {
 GRADIENT = [(0x77, 0xca, 0x9b), (0xcb, 0xc0, 0x6c), (0xdc, 0x4c, 0x4c)]           # btop cpu gradient
 WATERFALL = [(0x05, 0x07, 0x10), (0x12, 0x2a, 0x55), (0x3d, 0x7b, 0x46), (0xcb, 0xc0, 0x6c), (0xdc, 0x4c, 0x4c)]
 BARS = " ▁▂▃▄▅▆▇█"
-PROTO_SHORT = {"meshtastic": "MT", "lorawan": "LW", "meshcore": "MC"}
+PROTO_SHORT = {"meshtastic": "MT", "lorawan": "LW", "meshcore": "MC", "trustedwireless": "TW"}
 
 
 def _grad(stops, x: float) -> str:
@@ -71,7 +71,7 @@ class SpectrumView(Widget):
         self.freqs = core.freq_axis_hz
         self.history: deque[np.ndarray] = deque(maxlen=200)   # per-column dB, newest last
         self.markers: deque[tuple[int, int, str]] = deque(maxlen=200)  # (history index, column, color)
-        self.flash: dict[str, float] = {}                       # band label → flash until
+        self.flash: dict[int, float] = {}                       # id(band) → flash until (labels repeat)
         self.floor, self.ceil = -100.0, -40.0
         self._last_seq = -1
         self._rows_added = 0
@@ -97,8 +97,11 @@ class SpectrumView(Widget):
         db = self.core.take_spectrum("tui", "peak")   # peak over all FFTs since the last tick
         if db is None:
             return
-        if len(self.freqs) != len(db):
-            self.freqs = self.core.freq_axis_hz
+        if len(self.freqs) != len(db) or abs(self.freqs[len(self.freqs) // 2] - self.core.center_hz) > 1:
+            self.freqs = self.core.freq_axis_hz               # FFT size changed or the tuner was retuned
+            if len(self.freqs) == len(db):
+                self.history.clear()
+                self.markers.clear()
         width = max(self.size.width, 10)
         cols = self._columns(db, width)
         if self.current is not None and len(self.current) != width:
@@ -119,11 +122,11 @@ class SpectrumView(Widget):
             self._rows_added += 1
         self.refresh()
 
-    def mark(self, freq_hz: float, color: str, band_label: str | None):
+    def mark(self, freq_hz: float, color: str, band=None):
         width = max(self.size.width, 10)
         self.markers.append((self._rows_added, self.col_of(freq_hz, width), color))
-        if band_label:
-            self.flash[band_label] = time.time() + 1.5
+        if band is not None:
+            self.flash[id(band)] = time.time() + 1.5
 
     def render(self) -> Text:
         width, height = max(self.size.width, 10), max(self.size.height, 6)
@@ -131,7 +134,8 @@ class SpectrumView(Widget):
         if self.current is None or len(self.current) != width:
             out.append("waiting for spectrum…", style=BTOP["graph_text"])
             return out
-        bands = self.core.bands
+        on = self.core.active                      # only bands with a receiver running
+        bands = [b for b in self.core.bands if any(n in on for n in b.receivers)]
         # ruler rows: greedy stacking of overlapping bands
         rows: list[list] = []
         for b in bands:
@@ -193,7 +197,7 @@ class SpectrumView(Widget):
             labels = [" "] * width
             lstyles = [None] * width
             for a, z, b in r:
-                hot = self.flash.get(b.label, 0) > now
+                hot = self.flash.get(id(b), 0) > now
                 col = _hex(b.color, 1.0 if hot else 0.55)
                 for c in range(max(a, 0), min(z, width - 1) + 1):
                     bar[c] = "█" if hot else "━"
@@ -333,7 +337,7 @@ class MonitorTUI(App):
         dec = self.query_one("#decoders", DataTable)
         dec.border_title = "²decoders"
         dec.add_columns(" ", "receiver", "frm", "crc✗", "rssi", "snr", "ago")
-        order = {"meshtastic": 0, "meshcore": 1, "lorawan": 2}
+        order = {"meshtastic": 0, "meshcore": 1, "lorawan": 2, "trustedwireless": 3}
         for rx in sorted(self.core.cfg.receivers, key=lambda r: order.get(r.protocol, 9)):
             dec.add_row(*self._decoder_row(rx.name), key=rx.name)
         pk = self.query_one("#packets", DataTable)
@@ -347,9 +351,11 @@ class MonitorTUI(App):
         rx = next(r for r in self.core.cfg.receivers if r.name == name)
         st = self.core.stats[name]
         on = st.enabled
-        color = _hex(PROTOCOL_COLORS[rx.protocol]) if on else BTOP["inactive"]
+        out = name not in self.core.in_range                    # outside the tuned window: idle
+        color = _hex(PROTOCOL_COLORS[rx.protocol]) if on and not out else BTOP["inactive"]
         ago = "" if st.last_time is None else f"{int(time.time() - st.last_time)}s"
-        return (Text("■" if on else "□", style=color), Text(name, style=color if on else BTOP["inactive"]),
+        return (Text(("◌" if out else "■") if on else "□", style=color),
+                Text(name + (" (out of range)" if out else ""), style=color if on and not out else BTOP["inactive"]),
                 str(st.frames), Text(str(st.crc_errors), style=BTOP["hi"] if st.crc_errors else BTOP["graph_text"]),
                 "" if st.last_rssi is None else f"{st.last_rssi:.0f}",
                 "" if st.last_snr is None else f"{st.last_snr:.0f}", ago)
@@ -360,7 +366,7 @@ class MonitorTUI(App):
         for ev in self.core.drain_events():
             band = self.core.band_for(ev.frame)
             color = _hex(PROTOCOL_COLORS[ev.frame.protocol])
-            spec.mark(ev.frame.frequency_hz, color, band.label if band else None)
+            spec.mark(ev.frame.frequency_hz, color, band)
             if not self.paused:
                 self._add_packet(ev)
 

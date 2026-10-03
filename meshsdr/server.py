@@ -212,7 +212,10 @@ class Server:
 
     def _config(self) -> dict:
         c = self.core
-        return {"enabled": sorted(c.enabled), "fft_size": c.fft_size, "window": c.window, "gain": c.gain_info}
+        return {"enabled": sorted(c.enabled), "fft_size": c.fft_size, "window": c.window, "gain": c.gain_info,
+                "center_hz": c.center_hz, "in_range": sorted(c.in_range), "tunable": c.tunable,
+                "channels": c.channels(), "rx_freq": {rx.name: rx.frequency_hz for rx in c.cfg.receivers},
+                "bands": [asdict(b) for b in c.bands], "bands_version": c.bands_version}
 
     def _stats(self) -> dict:
         c = self.core
@@ -308,8 +311,31 @@ class Server:
             c.set_detectors({d for d in msg.get("detectors", []) if d in ("peak", "mean")})
         elif cmd == "enable":
             self.core.set_receivers_enabled(set(msg.get("receivers", [])))
+        elif cmd == "record":
+            try:
+                if msg.get("op") == "status":
+                    self._reply(c, msg, ok=True, recordings=self.core.recordings())
+                else:
+                    st = self.core.record_iq(msg.get("freq_hz"), msg.get("bw_hz"), float(msg.get("duration_s", 10)),
+                                             msg.get("format", "cf32"), msg.get("name"))
+                    log.info("%s: IQ recording %s", c.name, st["file"])
+                    self._reply(c, msg, ok=True, recording=st)
+            except (ValueError, TypeError, OSError) as e:
+                self._reply(c, msg, ok=False, error=str(e))
         elif cmd == "keys":
             self._keys_command(c, msg)
+        elif cmd == "channel":
+            try:
+                names = self.core.set_channel_frequency(str(msg.get("receiver")), float(msg.get("hz")))
+                self._reply(c, msg, ok=True, receivers=names)
+            except (ValueError, TypeError) as e:
+                self._reply(c, msg, ok=False, error=str(e))
+        elif cmd == "tune":
+            try:
+                self.core.set_center(float(msg.get("hz")))
+                self._reply(c, msg, ok=True, center_hz=self.core.center_hz)
+            except (ValueError, TypeError) as e:
+                self._reply(c, msg, ok=False, error=str(e))
         elif cmd == "gain":
             try:
                 self.core.set_gain(msg.get("value"))

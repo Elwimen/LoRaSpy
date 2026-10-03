@@ -56,6 +56,10 @@
     // { "preset": "LONG_MODERATE", "primary_channel": "LongFast" }, { "preset": "LONG_SLOW", "primary_channel": "LongFast" },
     // { "protocol": "lorawan", "plan": "EU868" },
     // { "protocol": "meshcore", "preset": "EU_UK_NARROW" },
+    // Encrypted 2-FSK frequency-hopping telemetry networks in 869.40–869.65 MHz (characteristics of
+    // Phoenix Contact "Trusted Wireless": 30 kHz channels, ~10 kBd). Shows frames, stations (by level
+    // and header address field) and timing; the payload is encrypted. Optional "channels": [MHz, …].
+    // { "protocol": "trustedwireless" },
   ],
 
   // ---------------------------------------------------------------- Meshtastic keys

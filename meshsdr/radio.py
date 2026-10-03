@@ -131,6 +131,9 @@ class ReceiverParams:
         return self.symbol_time_ms >= 16.0
 
     def describe(self) -> str:
+        if self.protocol == "trustedwireless":
+            return (f"{self.name} [trustedwireless]: {self.frequency_hz / 1e6:.4f} MHz, 30 kHz channel, "
+                    f"2-FSK ~10 kBd (encrypted: frames shown, not decrypted)")
         slot = f", slot {self.slot}" if self.slot is not None else ""
         iq = ", inverted IQ" if self.invert_iq else ""
         return (f"{self.name} [{self.protocol}]: {self.frequency_hz / 1e6:.4f} MHz, BW {self.bw_hz / 1e3:g} kHz, "
@@ -282,4 +285,19 @@ def resolve_receivers(region_name: str, spec: dict) -> list[ReceiverParams]:
         return resolve_lorawan(spec)
     if proto == "meshcore":
         return resolve_meshcore(spec)
-    raise ValueError(f"Unknown protocol '{proto}' (meshtastic, lorawan, meshcore)")
+    if proto in ("trustedwireless", "trusted-wireless", "tw"):
+        return resolve_trustedwireless(spec)
+    raise ValueError(f"Unknown protocol '{proto}' (meshtastic, lorawan, meshcore, trustedwireless)")
+
+
+# 2-FSK hopping telemetry networks in the 869.40–869.65 MHz sub-band (e.g. Phoenix Contact
+# Trusted Wireless): the 7 channels seen in use, 30 kHz apart
+TW_CHANNELS_HZ = [869.435e6 + 30e3 * i for i in range(7)]
+
+
+def resolve_trustedwireless(spec: dict) -> list[ReceiverParams]:
+    """{"protocol": "trustedwireless", "channels": [869.435, …] (MHz, optional)} → one
+    listener per hop channel. The payload is encrypted: frames are shown, not decrypted."""
+    chans = [float(f) * (1e6 if float(f) < 1e4 else 1) for f in spec.get("channels", [])] or TW_CHANNELS_HZ
+    return [ReceiverParams(name=f"TW {f / 1e6:.3f}", frequency_hz=f, bw_hz=30_000, sf=0, cr=0,
+                           protocol="trustedwireless", sync_word=0) for f in chans]

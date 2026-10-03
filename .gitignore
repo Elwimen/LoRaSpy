@@ -29,3 +29,6 @@ nodes_meshcore.json
 
 # README screenshots (made from simulated data, no real keys)
 !docs/screenshots/*.png
+
+# IQ recordings made with 'loraspy.py record'
+recordings/

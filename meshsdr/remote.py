@@ -116,6 +116,16 @@ class RemoteCore:
     def _apply_config(self, m: dict):
         self.fft_size = m["fft_size"]
         self.window = m["window"]
+        self.center_hz = m.get("center_hz", getattr(self, "center_hz", 0.0))
+        self._in_range = set(m["in_range"]) if "in_range" in m else None
+        self.tunable = m.get("tunable", False)
+        self._channels = m.get("channels", [])
+        if "rx_freq" in m and hasattr(self, "cfg"):
+            for rx in self.cfg.receivers:
+                rx.frequency_hz = m["rx_freq"].get(rx.name, rx.frequency_hz)
+        if "bands" in m and m.get("bands_version", 0) != getattr(self, "bands_version", 0):
+            self.bands = [Band(**d) for d in m["bands"]]
+        self.bands_version = m.get("bands_version", 0)
         self.gain_info = m.get("gain", {"supported": False, "mode": "auto", "gain": None, "steps": []})
         on = set(m["enabled"])
         for name, st in self.stats.items():
@@ -264,6 +274,33 @@ class RemoteCore:
 
     def keys_remove(self, kind: str, index: int):
         self._request({"cmd": "keys", "op": "remove", "kind": kind, "index": index})
+
+    def record_iq(self, freq_hz=None, bw_hz=None, duration_s: float = 10, fmt: str = "cf32",
+                  name: str | None = None) -> dict:
+        """Recorded by the process that owns the SDR, into its recordings/ folder."""
+        return self._request({"cmd": "record", "freq_hz": freq_hz, "bw_hz": bw_hz, "duration_s": duration_s,
+                              "format": fmt, "name": name})["recording"]
+
+    def recordings(self) -> list[dict]:
+        return self._request({"cmd": "record", "op": "status"})["recordings"]
+
+    def channels(self) -> list[dict]:
+        return list(self._channels)
+
+    def set_channel_frequency(self, receiver: str, hz: float) -> list[str]:
+        return self._request({"cmd": "channel", "receiver": receiver, "hz": float(hz)})["receivers"]
+
+    def set_center(self, hz: float):
+        """Retune the shared SDR (decoders stay on their channels)."""
+        self._request({"cmd": "tune", "hz": float(hz)})
+
+    @property
+    def in_range(self) -> set[str]:
+        return set(self.stats) if self._in_range is None else set(self._in_range)
+
+    @property
+    def active(self) -> set[str]:
+        return self.enabled & self.in_range
 
     def set_gain(self, value):
         """'auto' or dB; the server applies it to the shared SDR and tells everybody."""

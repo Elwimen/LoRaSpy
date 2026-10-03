@@ -302,6 +302,14 @@ class MonitorFlowgraph(gr.top_block):
                  realtime: bool = False, iq_loop: bool = False, spectrum_window=None):
         gr.top_block.__init__(self, "lora_sdr_monitor", catch_exceptions=True)
         self._keep: list = []   # see connect()
+        # [freq_xlating filter, frequency it extracts, reference (None = tuner centre)]: retuning
+        # and channel moves just change their offsets
+        self._xlates: list[list] = []
+        self._groups: dict = {}         # channel key → {entry, names, bw, protocol, configured, window}
+        self._rx_group: dict[str, object] = {}
+        self._rx_obj = {rx.name: rx for rx in receivers}
+        self._rx_freq = {rx.name: (rx.frequency_hz, rx.bw_hz) for rx in receivers}
+        self.in_range: set[str] = set(self._rx_freq)
         self._rtl = None        # osmosdr source when live (gain control)
         self.gain_steps: list[float] = []
         self.gain_mode = "auto" if str(sdr.gain).lower() == "auto" else "manual"
@@ -334,6 +342,9 @@ class MonitorFlowgraph(gr.top_block):
         # the graph valid with every receiver off
         self.spectrum = SpectrumTap(fft_size, spectrum_window or "Blackman-Harris", on_spectrum)
         self.connect(source, self.spectrum)
+        from .iqrec import IqTap
+        self.iq_tap = IqTap()          # IQ recordings (idle unless one is armed)
+        self.connect(source, self.iq_tap)
         self._source = source
 
         # Everything stays connected for the whole run. Receivers are switched on and off with
@@ -349,16 +360,19 @@ class MonitorFlowgraph(gr.top_block):
         conjs: dict[tuple, tuple[object, list]] = {}
         max_sf: dict[tuple, int] = {}
         wired: set[tuple] = set()
-        for rx in receivers:
+        lora_rxs = [rx for rx in receivers if rx.protocol != "trustedwireless"]
+        for rx in lora_rxs:
             key = (rx.frequency_hz, rx.bw_hz)
             max_sf[key] = max(max_sf.get(key, 0), rx.sf)
-        for rx in receivers:
+        for rx in lora_rxs:
             key = (rx.frequency_hz, rx.bw_hz)
             if key not in filters:
                 fgate = blocks.copy(gr.sizeof_gr_complex)
                 self.connect(source, fgate)
                 self._filter_gate[key] = fgate
                 head, edges = self._channel_filter(fgate, rx, center, samp_rate)
+                self._groups[key] = {"entry": self._last_xlate, "names": [], "bw": rx.bw_hz, "protocol": rx.protocol,
+                                     "configured": rx.frequency_hz, "window": None}
                 # frame_sync wants slightly more than one symbol (2^SF × OS) per call
                 head.set_min_output_buffer(4 * (2 ** max_sf[key]) * OS_FACTOR)
                 # channel power in 1 ms blocks for RSSI/SNR (C++ does the per-sample work)
@@ -411,7 +425,11 @@ class MonitorFlowgraph(gr.top_block):
                     self.connect((a, pa), (b, pb))
             self._rx_gate[rx.name] = gate
             self._rx_key[rx.name] = key
+            self._groups[key]["names"].append(rx.name)
+            self._rx_group[rx.name] = key
             self.py_blocks += [snr, sink]
+        self._build_fsk([rx for rx in receivers if rx.protocol == "trustedwireless"], source, center, samp_rate,
+                        on_frame)
         self._apply_gates()
         self._topo_lock = threading.RLock()   # start/stop (watchdog vs. shutdown)
         self.running = False
@@ -426,12 +444,110 @@ class MonitorFlowgraph(gr.top_block):
                 self._keep.append(b)
         return super().connect(*points)
 
+    def _build_fsk(self, rxs, source, center, samp_rate, on_frame):
+        """2-FSK hop channels (tw_rx): one C++ filter cuts out their block at 250 kS/s, then one
+        narrow C++ channel filter per hop channel to 50 kS/s feeds a Python burst demodulator.
+        Gated like the LoRa receivers (wide gate open while any of the channels is on)."""
+        if not rxs:
+            return
+        from .tw_rx import TwChannelSink
+
+        lo = min(r.frequency_hz for r in rxs) - 20e3
+        hi = max(r.frequency_hz for r in rxs) + 20e3
+        mid = (lo + hi) / 2
+        decim_w = max(1, int(samp_rate // 250e3))
+        rate_w = samp_rate / decim_w
+        if (hi - lo) / 2 > rate_w * 0.45:
+            raise ValueError("trustedwireless channels span more than the 250 kHz block they are cut out with")
+        fgate = blocks.copy(gr.sizeof_gr_complex)
+        wide = filter.freq_xlating_fir_filter_ccc(decim_w, firdes.low_pass(1.0, samp_rate, (hi - lo) / 2 + 5e3, 20e3),
+                                                  mid - center, samp_rate)
+        self.connect(source, fgate, wide)
+        self._xlates.append([wide, mid, None])
+        key = ("fsk", mid)
+        self._filter_gate[key] = fgate
+        decim_c = max(1, int(round(rate_w / 50e3)))
+        taps = firdes.low_pass(1.0, rate_w, 9e3, 4e3)        # ±9 kHz: the neighbours sit 30 kHz away
+        for rx in rxs:
+            gate = blocks.copy(gr.sizeof_gr_complex)
+            chan = filter.freq_xlating_fir_filter_ccc(decim_c, taps, rx.frequency_hz - mid, rate_w)
+            self._xlates.append([chan, rx.frequency_hz, mid])          # relative to the block, not the tuner
+            gkey = ("tw", rx.name)
+            half = rate_w * 0.45 - rx.bw_hz / 2
+            self._groups[gkey] = {"entry": self._xlates[-1], "names": [rx.name], "bw": rx.bw_hz,
+                                  "protocol": rx.protocol, "configured": rx.frequency_hz, "window": (mid - half, mid + half)}
+            self._rx_group[rx.name] = gkey
+            sink = TwChannelSink(rx, rate_w / decim_c, on_frame, self.rssi_offset, self.spectrum)
+            self.connect(wide, gate, chan, sink)
+            self._rx_gate[rx.name] = gate
+            self._rx_key[rx.name] = key
+            self.py_blocks.append(sink)
+        log.info("FSK listener: %d channels around %.4f MHz (%g kS/s → %g kS/s per channel)",
+                 len(rxs), mid / 1e6, rate_w / 1e3, rate_w / decim_c / 1e3)
+
     def _apply_gates(self):
-        on_keys = {self._rx_key[n] for n in self.enabled}
+        active = self.enabled & self.in_range           # out-of-range receivers idle
+        on_keys = {self._rx_key[n] for n in active}
         for key, g in self._filter_gate.items():
             g.set_enabled(key in on_keys)
         for name, g in self._rx_gate.items():
-            g.set_enabled(name in self.enabled)
+            g.set_enabled(name in active)
+
+    TUNE_MIN_HZ, TUNE_MAX_HZ = 24e6, 1766e6        # R828D tuner range
+
+    def channels(self) -> list[dict]:
+        """Channel groups: decoders sharing one filter move together."""
+        half = self.sample_rate / 2 * 0.98
+        out = []
+        for g in self._groups.values():
+            lo, hi = g["window"] or (self.center_hz - half + g["bw"] / 2, self.center_hz + half - g["bw"] / 2)
+            out.append({"receivers": list(g["names"]), "frequency_hz": g["entry"][1], "bw_hz": g["bw"],
+                        "protocol": g["protocol"], "configured_hz": g["configured"], "min_hz": lo, "max_hz": hi})
+        return out
+
+    def set_channel_frequency(self, receiver: str, hz: float) -> list[str]:
+        """Move the channel `receiver` belongs to (and every decoder sharing its filter)."""
+        key = self._rx_group.get(receiver)
+        if key is None:
+            raise ValueError(f"unknown receiver '{receiver}'")
+        g = self._groups[key]
+        hz = float(hz)
+        info = next(c for c in self.channels() if receiver in c["receivers"])
+        if not info["min_hz"] <= hz <= info["max_hz"]:
+            raise ValueError(f"{hz / 1e6:.4f} MHz is outside what this channel can reach now "
+                             f"({info['min_hz'] / 1e6:.4f}–{info['max_hz'] / 1e6:.4f} MHz)")
+        entry = g["entry"]
+        entry[1] = hz
+        entry[0].set_center_freq(hz - (self.center_hz if entry[2] is None else entry[2]))
+        for n in g["names"]:
+            self._rx_freq[n] = (hz, g["bw"])
+            self._rx_obj[n].frequency_hz = hz        # what decoded frames report
+        self._update_range()
+        self._apply_gates()
+        log.info("channel %s moved to %.4f MHz", ", ".join(g["names"]), hz / 1e6)
+        return list(g["names"])
+
+    def _update_range(self):
+        half = self.sample_rate / 2 * 0.98
+        self.in_range = {n for n, (f, bw) in self._rx_freq.items() if abs(f - self.center_hz) + bw / 2 <= half}
+
+    def set_center(self, hz: float):
+        """Retune the SDR. Every channel filter keeps extracting its own frequency (its offset
+        follows the new centre); receivers outside the new window go idle until tuned back."""
+        if self._rtl is None:
+            raise ValueError("only a live SDR can be retuned (not an IQ file)")
+        hz = float(hz)
+        if not self.TUNE_MIN_HZ <= hz <= self.TUNE_MAX_HZ:
+            raise ValueError(f"{hz / 1e6:.3f} MHz is outside the tuner range "
+                             f"{self.TUNE_MIN_HZ / 1e6:g}–{self.TUNE_MAX_HZ / 1e6:g} MHz")
+        self._rtl.set_center_freq(hz, 0)
+        for blk, f, ref in self._xlates:
+            blk.set_center_freq(f - (hz if ref is None else ref))
+        self.center_hz = hz
+        self._update_range()
+        self._apply_gates()
+        self.iq_tap.stop_all("stopped: the tuner was retuned")   # their offsets refer to the old centre
+        log.info("tuned to %.6f MHz; %d of %d receivers in range", hz / 1e6, len(self.in_range), len(self._rx_freq))
 
     def set_enabled(self, names: set[str]):
         """Run exactly the receivers in `names`; the others (and filters nobody uses) idle."""
@@ -463,10 +579,14 @@ class MonitorFlowgraph(gr.top_block):
         taps = firdes.low_pass(1.0, samp_rate, rx.bw_hz * 0.55, rx.bw_hz * 0.2)
         if ratio.denominator == 1:
             xlate = filter.freq_xlating_fir_filter_ccc(ratio.numerator, taps, rx.frequency_hz - center, samp_rate)
+            self._xlates.append([xlate, rx.frequency_hz, None])
+            self._last_xlate = self._xlates[-1]
             head, edges = xlate, [("s", source, 0, xlate, 0)]
         else:
             # e.g. 2.4 MS/s → 1 MS/s: shift/filter at full rate, then resample exactly
             xlate = filter.freq_xlating_fir_filter_ccc(1, taps, rx.frequency_hz - center, samp_rate)
+            self._xlates.append([xlate, rx.frequency_hz, None])
+            self._last_xlate = self._xlates[-1]
             resamp = filter.rational_resampler_ccc(interpolation=ratio.denominator, decimation=ratio.numerator)
             head, edges = resamp, [("s", source, 0, xlate, 0), ("s", xlate, 0, resamp, 0)]
         log.info("filter %.4f MHz/%g kHz: offset %+.1f kHz, %s → %.0f S/s", rx.frequency_hz / 1e6, rx.bw_hz / 1e3,

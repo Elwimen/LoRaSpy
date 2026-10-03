@@ -39,6 +39,7 @@ examples:
   loraspy.py listen --gui                    spectrum + waterfall window
   loraspy.py serve --gain 20                 headless: open the SDR and share it
   loraspy.py gain 15                         change the running SDR's gain (no value: show gain + ADC level)
+  loraspy.py tune 868.95M                    retune the running SDR (decoders stay on their channels)
   loraspy.py keys add channel name=X psk=random   add a channel (keys: list; live when running)
   loraspy.py listen --pcap cap.pcapng --jsonl cap.jsonl
   loraspy.py listen --iq-file cap.cu8 --iq-center 869.775e6 --iq-rate 2e6
@@ -48,7 +49,8 @@ One RTL-SDR, many front-ends: the first LoRaSpy (listen, --tui, --gui, serve or 
 SDR is released when the last one closes. Receivers, FFT and gain are shared settings.
 
 keys: TUI  1-4 boxes, space decoder, m/o/w protocol, [ ] gain, g AGC, k keys, p pause, f freeze, x clear, q quit
-      GUI  1-4 boxes, [ ] gain, G AGC, K keys, R reset view, Ctrl+, settings
+      GUI  1-4 boxes, [ ] gain, G AGC, K keys, R reset view, Ctrl+, settings; frequency dial: wheel
+           over a digit = ±1 in that place, right click = zero the digits to its right
 """
 
 
@@ -76,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--config", default="config.jsonc", help="JSONC config file (default: config.jsonc)")
     p.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    help="log verbosity on stderr (default: WARNING)")
-    sub = p.add_subparsers(dest="command", title="commands", metavar="{listen,serve,gain,keys,info}")
+    sub = p.add_subparsers(dest="command", title="commands", metavar="{listen,serve,gain,tune,channel,keys,record,info}")
 
     # ---- listen
     lp = sub.add_parser("listen", formatter_class=fmt,
@@ -144,6 +146,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="'auto' (tuner AGC) or dB, snapped to the nearest tuner step; omit to only show")
     add_share_args(gp, attach=False)
 
+    # ---- tune
+    tp = sub.add_parser("tune", formatter_class=fmt,
+                        help="show or set the running SDR's centre frequency (decoders stay on their channels)",
+                        description="Retune the running LoRaSpy's SDR. Every decoder keeps its own channel "
+                                    "frequency; those outside the new 2 MHz window go idle until tuned back.")
+    tp.add_argument("freq", nargs="?", help="869.0M, 868500k, 868500000 or MHz (868.5); omit to show")
+    add_share_args(tp, attach=False)
+
+    # ---- channel
+    cp = sub.add_parser("channel", formatter_class=fmt,
+                        help="list the running LoRaSpy's channels, or move one (runtime only)",
+                        description="Decoders sharing a channel filter (e.g. the Meshtastic presets on one "
+                                    "frequency, a LoRaWAN channel's SFs) move together. Not saved to the config.")
+    cp.add_argument("receiver", nargs="?", help="any decoder on the channel, e.g. LongFast or 'LW 868.1 SF7'")
+    cp.add_argument("freq", nargs="?", help="new centre: 869.5M, 869500k, MHz …; 'reset' = configured value")
+    add_share_args(cp, attach=False)
+
     # ---- keys
     kp = sub.add_parser("keys", formatter_class=fmt,
                         help="list, add, edit or remove channels and keys (keys.jsonc; live when running)",
@@ -174,6 +193,33 @@ examples:
                                                                      "add/edit: field=value pairs")
     kp.add_argument("--show-secrets", action="store_true", help="print keys in full (default: masked)")
     add_share_args(kp, attach=False)
+
+    # ---- record
+    rp = sub.add_parser("record", formatter_class=fmt,
+                        help="record IQ (whole band or a slice around a frequency) while decoding goes on",
+                        description="Record IQ samples into recordings/ next to the config. With a LoRaSpy "
+                                    "running, it records from the shared SDR without interrupting anything; "
+                                    "otherwise it opens the SDR just for the recording.",
+                        epilog="""\
+examples:
+  loraspy.py record --freq 869.525M --bw 40k --duration 60      one 40 kHz channel, 1 min
+  loraspy.py record --freq 869.525M --bw 300k --format cu8      cu8: rtl_433 -r FILE -s RATE …
+  loraspy.py record --duration 5                                the whole tuned band (big: ~16 MB/s cf32)
+  loraspy.py record --list                                      recordings made by the running LoRaSpy
+open with: inspectrum FILE.cf32 (rate from FILE.json) · URH · GNU Radio file source (complex) ·
+           rtl_433 -r FILE.cu8 -s RATE -f FREQ -A
+""")
+    rp.add_argument("--freq", metavar="F", help="centre frequency: 869.525M, 869525k, 869525000 or MHz (869.525); "
+                                               "default: tuner centre")
+    rp.add_argument("--bw", metavar="B", help="bandwidth to keep around --freq: 40k, 0.3M or Hz; "
+                                             "default: the whole tuned band, not decimated")
+    rp.add_argument("--duration", type=float, default=10.0, metavar="S", help="seconds (default 10, max 600)")
+    rp.add_argument("--format", choices=["cf32", "cu8"], default="cf32",
+                    help="cf32 = complex float32 (GNU Radio, inspectrum, URH); cu8 = rtl_sdr/rtl_433 bytes")
+    rp.add_argument("--name", help="file name (default: time_frequency_bandwidth)")
+    rp.add_argument("--list", action="store_true", help="list the running LoRaSpy's recordings and exit")
+    add_source_args(rp.add_argument_group("signal source (only when no LoRaSpy is running)"))
+    add_share_args(rp, attach=False)
 
     # ---- info
     sub.add_parser("info", help="show receivers, tuner plan, channel hashes and keys, then exit",
@@ -531,6 +577,77 @@ def cmd_gain(args) -> int:
         core.stop()
 
 
+def cmd_tune(args) -> int:
+    from meshsdr import share
+    from meshsdr.remote import RemoteCore
+
+    path = args.socket or share.default_socket_path()
+    if not share.server_alive(path):
+        print(f"no LoRaSpy is running ({path}); start one with: loraspy.py serve", file=sys.stderr)
+        return 1
+    core = RemoteCore(path, "tune-cli")
+    core.start()
+    try:
+        def show(prefix):
+            n, k = len(core.active), len(core.enabled)
+            print(f"{prefix}tuner {core.center_hz / 1e6:.6f} MHz @ {core.sample_rate / 1e6:g} MS/s · "
+                  f"{n} of {k} enabled decoders in range")
+        if args.freq is None:
+            show("")
+            out = sorted(core.enabled - core.in_range)
+            if out:
+                print("idle (outside the window): " + ", ".join(out))
+            return 0
+        show("before: ")
+        core.set_center(parse_hz(args.freq))
+        time.sleep(0.7)
+        show("now:    ")
+        return 0
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        core.stop()
+
+
+def cmd_channel(args) -> int:
+    from meshsdr import share
+    from meshsdr.remote import RemoteCore
+
+    path = args.socket or share.default_socket_path()
+    if not share.server_alive(path):
+        print(f"no LoRaSpy is running ({path}); start one with: loraspy.py serve", file=sys.stderr)
+        return 1
+    core = RemoteCore(path, "channel-cli")
+    core.start()
+    try:
+        chans = core.channels()
+        if args.receiver is None:
+            for ch in chans:
+                moved = "" if abs(ch["frequency_hz"] - ch["configured_hz"]) < 1 else \
+                    f"  (configured {ch['configured_hz'] / 1e6:.4f})"
+                names = ", ".join(ch["receivers"])
+                print(f"{ch['frequency_hz'] / 1e6:10.4f} MHz  {ch['bw_hz'] / 1e3:5g} kHz  {ch['protocol']:15} "
+                      f"{names[:70] + ('…' if len(names) > 70 else '')}{moved}")
+            return 0
+        ch = next((c for c in chans if args.receiver in c["receivers"]), None)
+        if ch is None:
+            raise ValueError(f"no decoder named '{args.receiver}' (see: loraspy.py channel)")
+        if args.freq is None:
+            print(f"{args.receiver}: {ch['frequency_hz'] / 1e6:.4f} MHz, reachable "
+                  f"{ch['min_hz'] / 1e6:.4f}–{ch['max_hz'] / 1e6:.4f} MHz, configured {ch['configured_hz'] / 1e6:.4f}")
+            return 0
+        hz = ch["configured_hz"] if args.freq == "reset" else parse_hz(args.freq)
+        names = core.set_channel_frequency(args.receiver, hz)
+        print(f"moved {len(names)} decoder(s) to {hz / 1e6:.4f} MHz: {', '.join(names)}")
+        return 0
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        core.stop()
+
+
 def cmd_keys(args) -> int:
     from meshsdr import keystore, share
 
@@ -639,6 +756,78 @@ def _keys_action(args, store, live: bool) -> int:
     return 0
 
 
+def parse_hz(text: str | None, mhz_if_small: bool = True) -> float | None:
+    """'869.525M', '40k', '869525000', '869.525' (MHz when it's that small) → Hz."""
+    if text is None:
+        return None
+    t = str(text).strip().lower().replace("hz", "")
+    mult = {"k": 1e3, "m": 1e6, "g": 1e9}.get(t[-1:], 1.0)
+    if t[-1:] in "kmg":
+        t = t[:-1]
+    try:
+        v = float(t) * mult
+    except ValueError:
+        raise ValueError(f"not a frequency: '{text}'") from None
+    if mult == 1.0 and mhz_if_small and v < 1e4:
+        v *= 1e6
+    return v
+
+
+def cmd_record(cfg, args) -> int:
+    from meshsdr import share
+
+    path = args.socket or share.default_socket_path()
+    live = share.server_alive(path)
+    try:
+        freq, bw = parse_hz(args.freq), parse_hz(args.bw, mhz_if_small=False)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if live:
+        from meshsdr.remote import RemoteCore
+        core = RemoteCore(path, "record-cli")
+        core.start()
+    elif args.list:
+        print("no LoRaSpy running; recordings are in recordings/ next to the config", file=sys.stderr)
+        return 0
+    else:
+        ust, _ = load_ui_settings(cfg, args)
+        core = open_local_core(cfg, args, ust, live_view=True)
+        core.set_receivers_enabled(set())          # recording only: no decoders
+        core.start()
+        time.sleep(1.0)                            # let the SDR settle
+    try:
+        if args.list:
+            for r in core.recordings():
+                print(f"{'done ' if r['done'] else 'busy '} {r['file']}  {r['frequency_hz'] / 1e6:.4f} MHz  "
+                      f"{r['sample_rate'] / 1e3:g} kS/s  {r['samples']} samples" + (f"  ERROR {r['error']}" if r['error'] else ""))
+            return 0
+        st = core.record_iq(freq, bw, args.duration, args.format, args.name)
+        mbps = st["sample_rate"] * (8 if args.format == "cf32" else 2) / 1e6
+        print(f"recording {st['frequency_hz'] / 1e6:.4f} MHz, {st['bandwidth_hz'] / 1e3:g} kHz → "
+              f"{st['sample_rate'] / 1e3:g} kS/s {args.format} ({mbps:.2f} MB/s), {args.duration:g} s"
+              + ("  (via the running LoRaSpy)" if live else "") + f"\n  {st['file']}", file=sys.stderr)
+        stop = threading.Event()
+        install_stop(stop)
+        r = None
+        while not stop.is_set():
+            r = next((x for x in core.recordings() if x["id"] == st["id"]), None)
+            if r is None or r["done"]:
+                break
+            stop.wait(1.0)
+        if r and r["error"]:
+            print(f"recording failed: {r['error']}", file=sys.stderr)
+            return 1
+        if r:
+            print(f"done: {r['samples']} samples ({r['samples'] / r['sample_rate']:.1f} s)\n  {r['file']}\n  {r['meta']}")
+        return 0
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        core.stop()
+
+
 def cmd_serve(cfg, args) -> int:
     from meshsdr import share
 
@@ -706,8 +895,14 @@ def main() -> int:
         return cmd_gain(args)
     if args.command == "keys":
         return cmd_keys(args)
+    if args.command == "tune":
+        return cmd_tune(args)
+    if args.command == "channel":
+        return cmd_channel(args)
     if args.command == "serve":
         return cmd_serve(cfg, args)
+    if args.command == "record":
+        return cmd_record(cfg, args)
     return cmd_listen(cfg, args)
 
 

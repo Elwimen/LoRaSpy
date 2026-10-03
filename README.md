@@ -141,6 +141,25 @@ Turning a decoder off in either view stops it: its demodulator is gated off (and
 filter too when no other decoder uses it), so it costs next to no CPU and its frames are
 neither shown nor logged.
 
+## Tuning and channels
+
+- **Frequency dial** (GUI toolbar, LCARS style): the SDR's centre frequency. Mouse wheel over
+  a digit changes that digit (with carry), right click zeroes every digit to its right; the
+  tuner follows 0.3 s after the wheel stops. `./loraspy.py tune 868.95M` does the same for
+  headless runs (`tune` alone shows it). Retuning is shared by every front-end.
+- Decoders **stay on their channels** when you retune: each channel filter just follows the new
+  centre. Decoders whose channel falls outside the new 2 MHz window go idle (greyed in the
+  decoder list, their bands hidden) and resume when you tune back.
+- **Channel settings**: right click a decoder → *Channel settings…* opens a dial for its
+  channel. Decoders sharing one filter move together (e.g. the Meshtastic presets on
+  869.525 MHz/250 kHz, a LoRaWAN frequency with all its SFs); a Trusted Wireless hop channel
+  moves on its own within 869.40–869.65 MHz. `./loraspy.py channel` lists the channels,
+  `./loraspy.py channel LongFast 869.4M` moves one, `… LongFast reset` puts it back.
+- Both are runtime settings: `config.jsonc` isn't rewritten, a restart uses the configured
+  frequencies. IQ files can't be retuned (their channels can be moved).
+
+The dial uses the Antonio font (SIL Open Font License, `meshsdr/fonts/`).
+
 ## Gain and clipping
 
 The RTL-SDR's ADC has 8 bits. A strong nearby transmitter (a node on the same desk) at high
@@ -227,6 +246,55 @@ LoRaTap can only express bandwidth in 125 kHz steps, so MeshCore's 62.5 kHz show
 the real value is in `sdrmon.bandwidth`. LoRaTap's RSSI fields are filled only when
 `sdr.rssi_offset_db` is calibrated (they're dBm). The measured dBFS values are always in
 `sdrmon.rssi_dbfs`, `sdrmon.noise_dbfs` and `sdrmon.snr`.
+
+## Encrypted FSK telemetry (Trusted Wireless)
+
+In 869.40–869.65 MHz there are often narrowband **2-FSK frequency-hopping** telemetry networks:
+7 channels 30 kHz apart, ~10 kBd, ±4 kHz deviation, a long `0101` preamble and an encrypted
+payload — the published characteristics of Phoenix Contact *Trusted Wireless 2.0* radios
+(Radioline, RAD-868), used for wireless I/O in water, energy and industrial plants. Enable the
+listener with a receiver entry:
+
+```jsonc
+{ "protocol": "trustedwireless" }                       // the 7 channels 869.435 … 869.615 MHz
+{ "protocol": "trustedwireless", "channels": [869.435, 869.465] }   // or your own list
+```
+
+Each hop channel gets a narrow C++ channel filter and a small 2-FSK demodulator (energy at
+±deviation per symbol, symbol clock fitted to the zero crossings, sync-word lock). The payload
+can't be decrypted, but every frame shows up in the packet lists, text output, JSONL and
+Wireshark with:
+
+- **station**: S1, S2, … clustered by received level, and **address field**: header bytes
+  6–7, which followed the transmitting station in every long frame recorded so far;
+- **role**: the first frame of an exchange (frames < 0.6 s apart) is the *initiator*
+  (polling master), the rest are *replies*;
+- size class, bits after the sync word, raw header bytes (bytes 0–4 behave like counters),
+  level/SNR, carrier offset and duration.
+
+It costs about half a CPU core with all 7 channels on; untick the "Trusted Wireless" group in
+the decoder list to stop it.
+
+## IQ recordings
+
+`loraspy.py record` saves raw IQ samples, for looking at signals LoRaSpy doesn't decode
+(inspectrum, URH, GNU Radio, rtl_433, …). With a LoRaSpy running it records from the shared
+SDR while decoding carries on; otherwise it opens the SDR just for the recording.
+
+```bash
+./loraspy.py record --freq 869.525M --bw 40k --duration 60     # one 40 kHz channel → 50 kS/s
+./loraspy.py record --freq 869.5235M --bw 200k --format cu8    # cu8 for rtl_433 / rtl_sdr tools
+./loraspy.py record --duration 5                               # whole tuned band, 2 MS/s
+./loraspy.py record --list                                     # what the running LoRaSpy recorded
+```
+
+- A slice (`--freq` + `--bw`) is shifted to 0 Hz, filtered and decimated to ≥ 1.25 × the
+  bandwidth (polyphase: a few % of one core per recording); without `--bw` the whole tuned
+  band is kept as received (16 MB/s in cf32).
+- Files go to `recordings/` next to the config (gitignored): `NAME.cf32` (complex float32) or
+  `NAME.cu8` (rtl_sdr bytes), plus `NAME.json` with centre frequency, sample rate, start
+  time, gain and tuner settings.
+- Several recordings can run at once, up to 600 s each.
 
 ## Channels and keys (editor)
 

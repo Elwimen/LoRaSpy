@@ -15,6 +15,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -71,8 +72,9 @@ class MonitorCore:
         self.node_db = NodeDB(cfg.node_db_file, _static_public_keys(cfg))
         self.mc_db = MeshCoreDB(cfg.node_db_file.replace(".json", "") + "_meshcore.json"
                                 if cfg.node_db_file else None, cfg.meshcore_public_keys)
+        from .trustedwireless import TrustedWirelessDecoder
         self.decoders = {"meshtastic": Decoder(cfg, self.node_db), "lorawan": LoRaWANDecoder(cfg),
-                         "meshcore": MeshCoreDecoder(cfg, self.mc_db)}
+                         "meshcore": MeshCoreDecoder(cfg, self.mc_db), "trustedwireless": TrustedWirelessDecoder()}
         self.formatter = Formatter("hextext", False, self.node_db, True, True)
         self.bands: list[Band] = receiver_bands(cfg.receivers)
         self.regulatory: list[Band] = regulatory_bands(cfg.region)
@@ -94,6 +96,9 @@ class MonitorCore:
         self.callbacks = []   # fn(Event), called on the worker thread
         self.on_change = []   # fn(), after receivers were enabled/disabled or the FFT changed
         self.on_keys = []     # fn(), after keys/channels were edited (keys.jsonc) and reloaded
+        self.bands_version = 0
+        self._recordings: dict = {}
+        self._rec_id = 0
         self.keys_version = 0
         self._reconf_lock = threading.Lock()
         self.server = None    # meshsdr.server.Server when this core is shared
@@ -170,6 +175,7 @@ class MonitorCore:
         self._stop.set()
         if self.server is not None:
             self.server.stop()
+        self.tb.iq_tap.stop_all()      # close running recordings (sidecar written)
         with self.tb._topo_lock:
             self.tb.stop()
             self.tb.wait()
@@ -240,6 +246,76 @@ class MonitorCore:
                 cb()
             except Exception:
                 log.exception("keys listener failed")
+
+    # ------------------------------------------------------------------ IQ recordings
+
+    def record_iq(self, freq_hz: float | None = None, bw_hz: float | None = None, duration_s: float = 10,
+                  fmt: str = "cf32", name: str | None = None) -> dict:
+        """Start recording IQ (whole band, or bw_hz around freq_hz) into recordings/ next to the
+        config; returns its status. Decoding continues meanwhile."""
+        import re
+
+        from .iqrec import IqRecording
+
+        base = (self.cfg.source_path.resolve().parent if self.cfg.source_path else Path.cwd()) / "recordings"
+        if name:
+            name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).name).strip("._") or "recording"
+        else:
+            f = (freq_hz or self.center_hz) / 1e6
+            name = time.strftime("%Y%m%d-%H%M%S") + f"_{f:.4f}MHz" + (f"_{bw_hz / 1e3:g}k" if bw_hz else "_full")
+        path = base / (name if name.endswith("." + fmt) else f"{name}.{fmt}")
+        g = self.gain_info
+        meta = {"source": "LoRaSpy", "tuner_center_hz": self.center_hz, "tuner_sample_rate": self.sample_rate,
+                "gain": "AGC" if g.get("mode") == "auto" else g.get("gain"), "supported_gain": g.get("supported")}
+        with self._lock:
+            self._rec_id += 1
+            job = IqRecording(self._rec_id, path, self.center_hz, self.sample_rate, freq_hz, bw_hz,
+                              float(duration_s), fmt, meta)
+            self._recordings[job.rid] = job
+        self.tb.iq_tap.add(job)
+        log.info("IQ recording %s: %.4f MHz, %s, %g s → %s", job.rid, job.freq / 1e6,
+                 "full band" if bw_hz is None else f"{bw_hz / 1e3:g} kHz", duration_s, path)
+        return job.status()
+
+    def recordings(self) -> list[dict]:
+        return [j.status() for j in self._recordings.values()]
+
+    # ------------------------------------------------------------------ tuning
+
+    def set_center(self, hz: float):
+        """Retune the SDR (shared). Decoders stay on their channels; those outside the new
+        window go idle."""
+        with self._reconf_lock:
+            self.tb.set_center(hz)
+            self.center_hz = self.tb.center_hz
+        self._changed()
+
+    def channels(self) -> list[dict]:
+        """Channel groups (decoders sharing a filter), with frequency, reachable range, configured."""
+        return self.tb.channels()
+
+    def set_channel_frequency(self, receiver: str, hz: float) -> list[str]:
+        """Move a decoder's channel (all decoders on the same filter move with it). Runtime only:
+        config.jsonc is not changed."""
+        with self._reconf_lock:
+            names = self.tb.set_channel_frequency(receiver, hz)
+            self.bands = receiver_bands(self.cfg.receivers)
+            self.bands_version += 1
+        self._changed()
+        return names
+
+    @property
+    def tunable(self) -> bool:
+        return self.tb._rtl is not None
+
+    @property
+    def in_range(self) -> set[str]:
+        return set(self.tb.in_range)
+
+    @property
+    def active(self) -> set[str]:
+        """Receivers really running: enabled and inside the tuned window."""
+        return self.enabled & self.tb.in_range
 
     @property
     def gain_info(self) -> dict:

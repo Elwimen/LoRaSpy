@@ -20,8 +20,9 @@ BG, FG, DIV, TITLE, HI = "#0b0d10", "#cccccc", "#303030", "#eeeeee", "#b54040"
 BOX = {"spectrum": "#3d7b46", "decoders": "#8a882e", "packets": "#423ba5", "details": "#923535"}
 WATERFALL_STOPS = [(0.0, (5, 7, 16)), (0.25, (18, 42, 85)), (0.5, (61, 123, 70)),
                    (0.75, (203, 192, 108)), (1.0, (220, 76, 76))]
-PROTO_NAME = {"meshtastic": "Meshtastic", "lorawan": "LoRaWAN", "meshcore": "MeshCore"}
-PROTO_ORDER = ["meshtastic", "meshcore", "lorawan"]
+PROTO_NAME = {"meshtastic": "Meshtastic", "lorawan": "LoRaWAN", "meshcore": "MeshCore",
+              "trustedwireless": "Trusted Wireless"}
+PROTO_ORDER = ["meshtastic", "meshcore", "lorawan", "trustedwireless"]
 MAX_COLS = 1024        # waterfall columns at most (max-pooled from the FFT bins; ≈ screen width)
 FLOOR_TAU_S = 8.0      # auto levels: the noise-floor estimate glides with this time constant
 
@@ -126,6 +127,57 @@ class SettingsDialog(QtWidgets.QDialog):
             peak_decay_db_s=self.decay.value()).validate())
 
 
+class ChannelDialog(QtWidgets.QDialog):
+    """Settings of one channel: the decoders sharing its filter move together (runtime only)."""
+
+    def __init__(self, parent, core, receiver: str):
+        super().__init__(parent)
+        from .gui_dial import FrequencyDial
+
+        self.core, self.receiver = core, receiver
+        ch = next(c for c in core.channels() if receiver in c["receivers"])
+        self.setWindowTitle(f"Channel — {receiver}")
+        lay = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        form.addRow("Protocol", QtWidgets.QLabel(PROTO_NAME.get(ch["protocol"], ch["protocol"])))
+        form.addRow("Bandwidth", QtWidgets.QLabel(f"{ch['bw_hz'] / 1e3:g} kHz"))
+        dec = QtWidgets.QLabel(", ".join(ch["receivers"]))
+        dec.setWordWrap(True)
+        form.addRow("Decoders on this channel", dec)
+        form.addRow("Configured", QtWidgets.QLabel(f"{ch['configured_hz'] / 1e6:.4f} MHz (config.jsonc)"))
+        self.range = QtWidgets.QLabel(f"{ch['min_hz'] / 1e6:.4f} – {ch['max_hz'] / 1e6:.4f} MHz "
+                                      f"(inside the tuned window)")
+        form.addRow("Reachable now", self.range)
+        lay.addLayout(form)
+        self.dial = FrequencyDial(ch["frequency_hz"], ch["min_hz"], ch["max_hz"], what="Channel centre frequency")
+        self.dial.changed.connect(self._apply)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self.dial)
+        row.addStretch(1)
+        lay.addLayout(row)
+        note = QtWidgets.QLabel("Moves the channel filter live; every decoder listed above follows. "
+                                "Not saved: a restart returns to the configured frequency.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8a8a8a;")
+        lay.addWidget(note)
+        bb = QtWidgets.QDialogButtonBox()
+        reset = bb.addButton("Reset to configured", QtWidgets.QDialogButtonBox.ButtonRole.ResetRole)
+        reset.clicked.connect(lambda: (self.dial._set(int(ch["configured_hz"]), now=True)))
+        bb.addButton(QtWidgets.QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
+        lay.addWidget(bb)
+
+    def _apply(self, hz: float):
+        try:
+            names = self.core.set_channel_frequency(self.receiver, hz)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Channel", str(e))
+            ch = next(c for c in self.core.channels() if self.receiver in c["receivers"])
+            self.dial.setValue(ch["frequency_hz"])
+            return
+        self.parent().statusBar().showMessage(f"{len(names)} decoder(s) moved to {hz / 1e6:.4f} MHz", 4000)
+
+
 def _box(title: str, color: str, widget: QtWidgets.QWidget) -> QtWidgets.QGroupBox:
     g = QtWidgets.QGroupBox(title)
     g.setStyleSheet(f"QGroupBox {{ border: 1px solid {color}; border-radius: 8px; margin-top: 10px; color: {TITLE};"
@@ -150,9 +202,11 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self._floor_init = False
         self._last_tick = time.time()
         self.markers: list[dict] = []
-        self.band_items: dict[str, pg.LinearRegionItem] = {}
-        self.flash_until: dict[str, float] = {}
-        self._band_hot: dict[str, bool] = {}
+        self.band_items: dict[int, pg.LinearRegionItem] = {}    # keyed by id(band): labels repeat (TW)
+        self.band_parts: dict[int, list] = {}                     # every overlay item of a band
+        self._band_shown: dict[int, bool] = {}
+        self.flash_until: dict[int, float] = {}
+        self._band_hot: dict[int, bool] = {}
         self.events: dict[int, object] = {}
 
         pg.setConfigOptions(antialias=False, background=BG, foreground=FG)
@@ -245,6 +299,8 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self._apply_tree = QtCore.QTimer(self, singleShot=True)
         self._apply_tree.timeout.connect(self._apply_tree_now)
         self.tree.itemChanged.connect(self._tree_changed)
+        self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
         self.boxes[2] = _box("²decoders", BOX["decoders"], self.tree)
         bottom.addWidget(self.boxes[2])
 
@@ -303,6 +359,15 @@ class MonitorWindow(QtWidgets.QMainWindow):
         reset.triggered.connect(self.reset_view)
         tb.addAction(reset)
         tb.addSeparator()
+        from .gui_dial import FrequencyDial
+        self.dial = FrequencyDial(self.core.center_hz)
+        self.dial.changed.connect(self._retune)
+        if not getattr(self.core, "tunable", False):
+            self.dial.setEnabled(False)
+            self.dial.setToolTip("Tuner centre frequency (fixed: replaying an IQ file)")
+        tb.addWidget(self.dial)
+        self._center_seen = self.core.center_hz
+        tb.addSeparator()
         self._build_gain(tb)
         # the three plots share one scene: one handler covers them all
         self.spec_plot.scene().sigMouseClicked.connect(lambda ev: ev.double() and self.reset_view())
@@ -325,8 +390,6 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.reg_labels: list[tuple[pg.TextItem, float]] = []
         # regulatory sub-bands: faint strips at the bottom of the spectrum plot
         for b in self.core.regulatory:
-            if b.end_hz / 1e6 < self.freqs_mhz[0] or b.start_hz / 1e6 > self.freqs_mhz[-1]:
-                continue
             reg = pg.LinearRegionItem((b.start_hz / 1e6, b.end_hz / 1e6), movable=False,
                                       brush=pg.mkBrush(120, 120, 140, 18), pen=pg.mkPen((120, 120, 140, 60)))
             reg.setZValue(-20)
@@ -334,41 +397,71 @@ class MonitorWindow(QtWidgets.QMainWindow):
             t = pg.TextItem(b.label, color=(140, 140, 160), anchor=(0.5, 1))
             self.spec_plot.addItem(t, ignoreBounds=True)
             self.reg_labels.append((t, b.center_hz / 1e6))
-        # protocol bands: shaded on the spectrum, edges dashed on the waterfall, and drawn as
-        # labelled bars in the band strip (stacked so neither bars nor labels overlap; label
-        # width is estimated for the full-span view, ~190 characters across)
+        self._add_band_overlays()
+        self._apply_spectrum_scale()
+
+    def _remove_band_overlays(self):
+        for b_id, parts in self.band_parts.items():
+            for plot, item in zip((self.spec_plot, self.wf_plot, self.wf_plot, self.band_plot, self.band_plot), parts):
+                plot.removeItem(item)
+        self.band_parts.clear()
+        self.band_items.clear()
+        self._band_shown.clear()
+        self._band_hot.clear()
+        self.flash_until.clear()
+
+    def _add_band_overlays(self):
+        """Protocol bands: shaded on the spectrum, edges dashed on the waterfall, and drawn as
+        labelled bars in the band strip (stacked so neither bars nor labels overlap; label
+        width is estimated for the full-span view, ~190 characters across)."""
+        self._bands_version = getattr(self.core, "bands_version", 0)
         mhz_per_char = (self.freqs_mhz[-1] - self.freqs_mhz[0]) / 190
-        used: list[tuple[float, float, int]] = []
-        self.band_bars: dict[str, pg.BarGraphItem] = {}
+        self.band_bars: dict[int, pg.BarGraphItem] = {}
+        self._strip: list[tuple] = []
         for b in self.core.bands:
             r, g, bl = b.color
             reg = pg.LinearRegionItem((b.start_hz / 1e6, b.end_hz / 1e6), movable=False,
                                       brush=pg.mkBrush(r, g, bl, 30), pen=pg.mkPen((r, g, bl, 150)))
             reg.setZValue(-10)
             self.spec_plot.addItem(reg, ignoreBounds=True)
-            self.band_items[b.label] = reg
+            self.band_items[id(b)] = reg
+            parts = self.band_parts[id(b)] = [reg]
             for edge in (b.start_hz, b.end_hz):
                 line = pg.InfiniteLine(edge / 1e6, angle=90,
                                        pen=pg.mkPen((r, g, bl, 90), style=QtCore.Qt.PenStyle.DashLine))
                 self.wf_plot.addItem(line, ignoreBounds=True)
+                parts.append(line)
             half = max(len(b.label) * mhz_per_char / 2 + mhz_per_char, (b.end_hz - b.start_hz) / 2e6)
             lo, hi = b.center_hz / 1e6 - half, b.center_hz / 1e6 + half
             level = 0
-            while any(not (hi < a0 or lo > a1) and lv == level for a0, a1, lv in used):
-                level += 1
-            used.append((lo, hi, level))
             bar = pg.BarGraphItem(x0=[b.start_hz / 1e6], x1=[b.end_hz / 1e6], y0=[level + 0.08], height=[0.84],
                                   brush=pg.mkBrush(r, g, bl, 70), pen=pg.mkPen((r, g, bl, 200)))
             bar.setToolTip(f"{b.label}\n{b.start_hz / 1e6:.4f}–{b.end_hz / 1e6:.4f} MHz\n{b.detail}")
             self.band_plot.addItem(bar)
-            self.band_bars[b.label] = bar
+            self.band_bars[id(b)] = bar
             t = pg.TextItem(b.label, color=(235, 235, 235), anchor=(0.5, 0.5))
             t.setPos(b.center_hz / 1e6, level + 0.5)
             self.band_plot.addItem(t, ignoreBounds=True)
+            parts += [bar, t]
+            self._strip.append((b, bar, t, lo, hi))
+        self._layout_band_strip()
+
+    def _layout_band_strip(self):
+        """Stack the visible band bars so neither bars nor labels overlap (hidden bands, whose
+        receivers are all off, take no row)."""
+        used: list[tuple[float, float, int]] = []
+        for b, bar, t, lo, hi in self._strip:
+            if not self._band_shown.get(id(b), True):
+                continue
+            level = 0
+            while any(not (hi < a0 or lo > a1) and lv == level for a0, a1, lv in used):
+                level += 1
+            used.append((lo, hi, level))
+            bar.setOpts(y0=[level + 0.08])
+            t.setPos(b.center_hz / 1e6, level + 0.5)
         levels = max((lv for _, _, lv in used), default=0) + 1
         self.band_plot.setYRange(0, levels, padding=0)
         self.band_plot.setFixedHeight(22 * levels + 6)
-        self._apply_spectrum_scale()
 
     # ------------------------------------------------------------------ gain / ADC level
 
@@ -599,11 +692,11 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.marker_scatter.setData([{"pos": (m["f"], (self.row_count - m["row"]) * self.row_dt),
                                       "brush": pg.mkBrush(m["color"])} for m in self.markers])
         for b in self.core.bands:
-            hot = self.flash_until.get(b.label, 0) > now
-            if self._band_hot.get(b.label) != hot:       # redraw only on change
-                self._band_hot[b.label] = hot
-                self.band_items[b.label].setBrush(pg.mkBrush(*b.color, 100 if hot else 30))
-                self.band_bars[b.label].setOpts(brush=pg.mkBrush(*b.color, 230 if hot else 70))
+            hot = self.flash_until.get(id(b), 0) > now
+            if self._band_hot.get(id(b)) != hot:         # redraw only on change
+                self._band_hot[id(b)] = hot
+                self.band_items[id(b)].setBrush(pg.mkBrush(*b.color, 100 if hot else 30))
+                self.band_bars[id(b)].setOpts(brush=pg.mkBrush(*b.color, 230 if hot else 70))
 
     def _tick_trace(self):
         """Spectrum trace: detector over all FFTs since the previous refresh (no averaging)."""
@@ -653,7 +746,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
         color = QtGui.QColor(*PROTOCOL_COLORS[ev.frame.protocol])
         band = self.core.band_for(ev.frame)
         if band:
-            self.flash_until[band.label] = time.time() + 1.5
+            self.flash_until[id(band)] = time.time() + 1.5
         text = pg.TextItem(f"{s['kind'][:14]} {s['src'][:12]}".strip(), color=color if s["ok"] else QtGui.QColor(HI),
                            anchor=(0, 0.5))
         self.wf_plot.addItem(text, ignoreBounds=True)
@@ -704,9 +797,58 @@ class MonitorWindow(QtWidgets.QMainWindow):
         finally:
             self._syncing = False
 
+    def _retune(self, hz: float):
+        try:
+            self.core.set_center(hz)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 5000)
+            self.dial.setValue(self.core.center_hz)
+            return
+        self.statusBar().showMessage(f"tuned to {hz / 1e6:.6f} MHz", 3000)
+
+    def _follow_center(self):
+        """The tuner was retuned (here or by another front-end): new frequency axis."""
+        c = self.core
+        if abs(c.center_hz - self._center_seen) < 0.5:
+            return
+        self._center_seen = c.center_hz
+        self.dial.setValue(c.center_hz)
+        self._reset_waterfall()
+        f0, f1 = self.freqs_mhz[0], self.freqs_mhz[-1]
+        for plot in (self.band_plot, self.spec_plot, self.wf_plot):
+            plot.setLimits(xMin=f0, xMax=f1, minXRange=(f1 - f0) / 200)
+        self.spec_plot.setXRange(f0, f1, padding=0)
+        self.setWindowTitle(f"LoRaSpy — {c.center_hz / 1e6:.4f} MHz @ {c.sample_rate / 1e6:g} MS/s")
+        self.peak = None
+
+    def _follow_bands(self):
+        """A channel was moved (here or by another front-end): redraw the band overlays."""
+        if getattr(self.core, "bands_version", 0) != self._bands_version:
+            self._remove_band_overlays()
+            self._add_band_overlays()
+
+    def _sync_band_visibility(self):
+        """A band's overlays (shading, waterfall edges, strip bar and label) only while at least
+        one of its receivers is enabled — here or from another front-end on the same SDR."""
+        on = self.core.active if hasattr(self.core, "active") else self.core.enabled
+        changed = False
+        for b in self.core.bands:
+            shown = any(n in on for n in b.receivers)
+            if self._band_shown.get(id(b)) != shown:
+                self._band_shown[id(b)] = shown
+                changed = True
+                for item in self.band_parts.get(id(b), []):
+                    item.setVisible(shown)
+        if changed:
+            self._layout_band_strip()
+
     def _tick_slow(self):
         c = self.core
+        self._follow_center()
+        self._follow_bands()
         self._sync_shared()
+        inr = c.in_range if hasattr(c, "in_range") else set(self.tree_items)
+        self._sync_band_visibility()
         self._sync_gain()
         self._show_adc()
         for name, it in self.tree_items.items():
@@ -715,6 +857,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
             it.setText(2, str(st.crc_errors))
             it.setText(3, "" if st.last_rssi is None else f"{st.last_rssi:.0f}")
             it.setText(4, "" if st.last_snr is None else f"{st.last_snr:.1f}")
+            out = name not in inr
+            if it.data(0, QtCore.Qt.ItemDataRole.ToolTipRole) != ("outside the tuned window: idle" if out else None):
+                it.setToolTip(0, "outside the tuned window: idle" if out else None)
+                it.setForeground(0, QtGui.QBrush(QtGui.QColor("#6a6a6a")) if out else QtGui.QBrush())
         up = int(time.time() - c.started)
         per = "  ".join(f"{PROTO_NAME[p]} {n}" for p, n in sorted(c.per_protocol.items()))
         self.status.setText(f"{c.role}   up {up // 3600}:{up // 60 % 60:02d}:{up % 60:02d}   "
@@ -724,6 +870,16 @@ class MonitorWindow(QtWidgets.QMainWindow):
                             f"{c.sample_rate / c.fft_size / 1e3:.2f} kHz/bin   "
                             f"waterfall {self.settings.lines_per_second:g} lines/s, {self.settings.history_s:g} s   "
                             f"levels {self.floor:.0f}…{self.ceil:.0f} dB")
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        name = item.data(0, QtCore.Qt.ItemDataRole.UserRole) if item else None
+        if not name or not hasattr(self.core, "channels"):
+            return
+        menu = QtWidgets.QMenu(self)
+        act = menu.addAction(f"Channel settings… ({name})")
+        if menu.exec(self.tree.viewport().mapToGlobal(pos)) is act:
+            ChannelDialog(self, self.core, name).exec()
 
     def _tree_changed(self, item: QtWidgets.QTreeWidgetItem, col: int):
         """Receivers are enabled individually; group boxes just drive/reflect their children.

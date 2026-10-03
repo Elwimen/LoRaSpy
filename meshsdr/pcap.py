@@ -76,6 +76,9 @@ def comment_for(pkt) -> str:
         for k in ("text", "name", "type", "signature_ok"):
             if k in pkt.fields:
                 kv[k] = pkt.fields[k]
+    elif pkt.protocol == "trustedwireless":
+        kv.update(station=pkt.station, addr=pkt.addr, role=pkt.role, type=pkt.kind, nbits=pkt.nbits,
+                  exchange=pkt.exchange, header=pkt.header.hex())
     elif pkt.protocol == "lorawan":
         if pkt.plaintext is not None:
             kv["plain"] = pkt.plaintext.hex()

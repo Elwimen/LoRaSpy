@@ -12,6 +12,7 @@ PROTOCOL_COLORS = {  # (r, g, b); also used by the TUI
     "meshtastic": (103, 234, 148),   # green
     "lorawan": (94, 166, 255),       # blue
     "meshcore": (255, 170, 64),      # orange
+    "trustedwireless": (190, 130, 255),  # purple
     "regulatory": (120, 120, 140),   # grey
 }
 
@@ -67,6 +68,8 @@ def receiver_bands(receivers: list[ReceiverParams]) -> list[Band]:
                 b.label += " RX2"
         elif proto == "meshcore":
             b.label, b.detail = f"MeshCore {kbw}", ", ".join(b.receivers)
+        elif proto == "trustedwireless":
+            b.label, b.detail = "TW", f"{fm:.3f} MHz, 2-FSK hop channel (encrypted)"
         else:
             b.label, b.detail = f"Meshtastic {kbw}", ", ".join(b.receivers)
     return sorted(groups.values(), key=lambda b: (b.start_hz, b.protocol))
