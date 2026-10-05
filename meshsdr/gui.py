@@ -245,7 +245,8 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.wf_plot = glw.addPlot(row=2, col=0)
         self.wf_plot.setLabel("left", "seconds ago")
         self.wf_plot.setLabel("bottom", "MHz")
-        self.wf_plot.invertY(True)
+        # Time flows upward: the newest line is at the bottom (y=0, "now") and signals rise as they age.
+        self.wf_plot.invertY(False)
         self.wf_plot.setXLink(self.spec_plot)
         self.wf_plot.setMouseEnabled(x=True, y=False)
         self.band_plot.setXLink(self.spec_plot)

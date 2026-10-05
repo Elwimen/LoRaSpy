@@ -167,7 +167,8 @@ class SpectrumView(Widget):
             if r == bars_h - 1:
                 pass
             out.append("\n")
-        # waterfall: newest at top, 2 history rows per character row via ▀ (fg = newer, bg = older)
+        # waterfall: time flows upward — newest at the bottom, 2 history rows per character row
+        # via ▀ (fg = upper half = older, bg = lower half = newer), so signals rise as they age
         hist = list(self.history)
         if self._acc is not None:
             hist.append(self._acc)          # the row still being accumulated
@@ -176,8 +177,9 @@ class SpectrumView(Widget):
             age = self._rows_added - idx    # 0 = the row being accumulated
             marker_at[(age, col)] = color
         for r in range(wf_h):
+            br = wf_h - 1 - r               # 0 at the bottom = newest
             for c in range(width):
-                ages = (2 * r, 2 * r + 1)
+                ages = (2 * br + 1, 2 * br)   # upper sub-pixel older, lower sub-pixel newer
                 vals = []
                 for a in ages:
                     vals.append(hist[-1 - a][c] if a < len(hist) else self.floor)
