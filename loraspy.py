@@ -184,14 +184,19 @@ examples:
   loraspy.py decoder add protocol=trustedwireless offset_khz=-15 name=B
   loraspy.py decoder set LongFast sf=12 frequency=869.5M    change parameters
   loraspy.py decoder reset LongFast                 back to its config.jsonc parameters
-  loraspy.py decoder remove LF-slot3                remove an added decoder (and its siblings)
+  loraspy.py decoder remove LF-slot3                remove a decoder (a config one is hidden; reset-all restores it)
+  loraspy.py decoder reset-all                      drop every added/changed/removed decoder, switch all off
+  loraspy.py decoder enable LongFast MediumSlow     switch decoders on (they start off); 'all' for every one
+  loraspy.py decoder disable all                    switch every decoder off
 fields for 'add': any config.jsonc receiver key (preset, protocol, frequency_hz, bandwidth_hz,
   spreading_factor, coding_rate, channel_num, primary_channel, region, plan, offset_khz, name …) plus
   sync_word and invert_iq. 'set' takes frequency (or frequency_hz), bw_hz, sf, cr, sync_word, invert_iq.
 """)
-    dp.add_argument("action", nargs="?", default="list", choices=["list", "add", "set", "reset", "remove"])
+    dp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "set", "reset", "remove", "reset-all", "enable", "disable"])
     dp.add_argument("rest", nargs="*", metavar="NAME|field=value",
-                    help="set/reset/remove: the decoder name first; add/set: field=value pairs")
+                    help="set/reset/remove: the decoder name first; add/set: field=value pairs; "
+                         "enable/disable: decoder names (or 'all')")
     add_share_args(dp, attach=False)
 
     # ---- keys
@@ -709,11 +714,12 @@ def cmd_decoder(args) -> int:
                 raise ValueError(f"'{args.action}' needs the decoder name first (see: loraspy.py decoder)")
             name = rest.pop(0)
         fields = {}
-        for kv in rest:
-            k, sep, v = kv.partition("=")
-            if not sep:
-                raise ValueError(f"expected field=value, got '{kv}'")
-            fields[k.strip()] = _field_value(v)
+        if args.action in ("add", "set"):
+            for kv in rest:
+                k, sep, v = kv.partition("=")
+                if not sep:
+                    raise ValueError(f"expected field=value, got '{kv}'")
+                fields[k.strip()] = _field_value(v)
         if args.action == "list":
             for d in core.decoder_list():
                 mark = "+" if d["origin"] == "added" else "*" if d["overridden"] else " "
@@ -742,6 +748,26 @@ def cmd_decoder(args) -> int:
             print(f"{name}: {core.decoder_reset(name)}")
         elif args.action == "remove":
             print(f"removed {', '.join(core.decoder_remove(name))}")
+        elif args.action == "reset-all":
+            print(core.decoder_reset_all())
+        elif args.action in ("enable", "disable"):
+            on = args.action == "enable"
+            allnames = [d["name"] for d in core.decoder_list()]
+            if not rest or rest == ["all"]:
+                sel = set(allnames)
+            else:
+                sel = set(rest)
+                unknown = sel - set(allnames)
+                if unknown:
+                    raise ValueError(f"unknown decoder(s): {', '.join(sorted(unknown))}")
+            cur = set(core.enabled)
+            new = (cur | sel) if on else (cur - sel)
+            core.set_receivers_enabled(new, persist=True)
+            if live:
+                core.decoder_list()   # round-trip: the enable is delivered before we disconnect
+            suffix = "" if live else " (applies at the next start)"
+            print(f"{'enabled' if on else 'disabled'} {', '.join(sorted(sel))}; "
+                  f"{len(new)} of {len(allnames)} decoders on{suffix}")
         return 0
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)

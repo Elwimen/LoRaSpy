@@ -6,7 +6,9 @@ hand-written config.jsonc is never rewritten:
 
     {
       "add":      [ {receiver spec, as in config.jsonc "receivers"}, … ],
-      "override": { "LongFast": {"frequency_hz": 869.4e6, "sf": 11, …}, … }
+      "override": { "LongFast": {"frequency_hz": 869.4e6, "sf": 11, …}, … },
+      "remove":   [ "RX2-SF12", … ],     // config.jsonc decoders hidden from the UI
+      "enabled":  [ "LongFast", … ]      // decoders switched on (absent = none active)
     }
 
 Every change is checked by loading the whole merged configuration before it is saved.
@@ -22,7 +24,8 @@ from . import config as C
 
 HEADER = ("// LoRaSpy decoders added or changed from the UIs (GUI ⚙ / ＋ Add decoder…, `loraspy.py decoder`).\n"
           "// Merged with config.jsonc at load: \"add\" = extra receiver specs, \"override\" = per-decoder\n"
-          "// parameters (frequency_hz, bw_hz, sf, cr, sync_word, invert_iq).\n")
+          "// parameters (frequency_hz, bw_hz, sf, cr, sync_word, invert_iq), \"remove\" = config.jsonc\n"
+          "// decoders hidden from the UI, \"enabled\" = decoders switched on (absent = none active).\n")
 
 
 class DecoderStore:
@@ -34,6 +37,7 @@ class DecoderStore:
         d = C.load_jsonc(self.path) if self.path.exists() else {}
         d.setdefault("add", [])
         d.setdefault("override", {})
+        d.setdefault("remove", [])
         return d
 
     def _save(self, d: dict):
@@ -97,6 +101,37 @@ class DecoderStore:
         d["override"].pop(name, None)
         self._check_and_save(d)
 
+    def remove_config(self, name: str) -> list[str]:
+        """Hide a config.jsonc decoder (it reappears after reset_all)."""
+        d = self.load()
+        if name not in d["remove"]:
+            d["remove"].append(name)
+        d["override"].pop(name, None)
+        self._check_and_save(d)
+        return [name]
+
+    def reset_all(self):
+        """Back to the config.jsonc decoder set: drop every addition, override, removal and the
+        enabled list (so no decoder is active)."""
+        old = self.path.read_text(encoding="utf-8") if self.path.exists() else None
+        self.path.unlink(missing_ok=True)
+        try:
+            C.load_config(self.config_path)
+        except C.ConfigError as e:
+            if old is not None:
+                self.path.write_text(old, encoding="utf-8")
+            raise ValueError(str(e)) from e
+
+    def enabled(self) -> set[str] | None:
+        d = self.load()
+        return set(d["enabled"]) if "enabled" in d else None
+
+    def set_enabled(self, names) -> None:
+        """Persist exactly these decoders as switched on (empty = none, stored as absent)."""
+        d = self.load()
+        d["enabled"] = sorted(set(names))
+        self._check_and_save(d)
+
 
 class OfflineDecoders:
     """The core's decoder API without a running LoRaSpy (CLI): edits decoders.jsonc only; the
@@ -137,6 +172,18 @@ class OfflineDecoders:
 
     def decoder_remove(self, name: str) -> list[str]:
         rx = self._find(name)
-        if rx.origin != "added":
-            raise ValueError(f"'{name}' comes from config.jsonc: remove it there")
-        return self.store.remove(rx.spec_index)
+        if rx.origin == "added":
+            return self.store.remove(rx.spec_index)
+        return self.store.remove_config(name)
+
+    def decoder_reset_all(self) -> str:
+        self.store.reset_all()
+        return "reset to the config.jsonc decoders (applies at the next start)"
+
+    @property
+    def enabled(self) -> set[str]:
+        return self.store.enabled() or set()
+
+    def set_receivers_enabled(self, names, persist: bool = True) -> None:
+        known = {r.name for r in self._receivers()}
+        self.store.set_enabled(set(names) & known)

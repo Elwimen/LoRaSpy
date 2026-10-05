@@ -166,9 +166,9 @@ class DecoderDialog(QtWidgets.QDialog):
             notes.append(f"Remove also removes {', '.join(d['spec_mates'])} (added together).")
         self.mates.setText("\n".join(notes))
         self.reset_btn.setEnabled(d["overridden"])
-        self.remove_btn.setEnabled(d["origin"] == "added")
+        self.remove_btn.setEnabled(hasattr(self.core, "decoder_remove"))
         self.remove_btn.setToolTip("" if d["origin"] == "added" else
-                                   "defined in config.jsonc: untick it to stop it, or remove it there")
+                                   "defined in config.jsonc: Remove hides it; “Reset to default decoders” brings it back")
         return True
 
     def _apply(self):
@@ -188,7 +188,9 @@ class DecoderDialog(QtWidgets.QDialog):
 
     def _remove(self):
         names = [self.name] + self.info["spec_mates"]
-        if QtWidgets.QMessageBox.question(self, "Remove decoder", f"Remove {', '.join(names)}?") != \
+        extra = "" if self.info["origin"] == "added" else \
+            "\n\nIt comes from config.jsonc — removing only hides it; “Reset to default decoders” brings it back."
+        if QtWidgets.QMessageBox.question(self, "Remove decoder", f"Remove {', '.join(names)}?{extra}") != \
                 QtWidgets.QMessageBox.StandardButton.Yes:
             return
         ok, gone = _busy(self, self.core.decoder_remove, self.name)

@@ -39,6 +39,7 @@ pip install --user meshtastic cryptography
 
 cp config.example.jsonc config.jsonc   # then add your channels / keys
 ./loraspy.py info                  # check frequencies, channel hashes, keys
+./loraspy.py decoder enable all    # decoders start off; switch some (or all) on (remembered)
 ./loraspy.py listen
 ```
 
@@ -134,19 +135,27 @@ decoder toggles.
 - A decoder tree with checkboxes. A group box ticks or unticks all its receivers and shows
   "partial" when only some are on. Plus a packet table and a detail view.
 - Toolbar: tuner **gain** slider + **AGC** checkbox, and the ADC level / **CLIPPING** warning.
-- Keys: `1`–`4` show/hide the boxes (also toolbar buttons), `[` `]` gain down/up, `G` AGC, `K` keys,
-  `R` or double-click resets the view, `Ctrl+,` opens Settings.
+- Keys: `Ctrl+1`–`Ctrl+4` show/hide the boxes (also toolbar buttons), `[` `]` gain down/up,
+  `G` AGC, `K` keys, `R` or double-click resets the view, `Ctrl+,` opens Settings. (Plain `1`–`4`
+  type into the frequency dial when it has focus.)
 
-Turning a decoder off in either view stops it: its demodulator is gated off (and its channel
+**No decoder is active until you switch one on.** A fresh start (or after *Reset to default
+decoders*) runs nothing; tick decoders in the tree (or `space` in the TUI, `loraspy.py decoder
+enable …`) to start them. The choice is remembered: it is saved to `decoders.jsonc` and restored
+at the next start, and shared with any other front-end on the same SDR.
+
+Turning a decoder off stops it: its demodulator is gated off (and its channel
 filter too when no other decoder uses it), so it costs next to no CPU and its frames are
 neither shown nor logged.
 
 ## Tuning and channels
 
 - **Frequency dial** (GUI toolbar, LCARS style): the SDR's centre frequency. Mouse wheel over
-  a digit changes that digit (with carry), right click zeroes every digit to its right; the
-  tuner follows 0.3 s after the wheel stops. `./loraspy.py tune 868.95M` does the same for
-  headless runs (`tune` alone shows it). Retuning is shared by every front-end.
+  a digit changes that digit (with carry), right click zeroes every digit to its right. Click
+  it (or tab to it) for the keyboard: `←`/`→` pick a digit, `↑`/`↓` change it, `0`–`9` type a
+  digit (stepping right), `Home`/`End` jump to the first/last digit. The tuner follows 0.3 s
+  after the last change. `./loraspy.py tune 868.95M` does the same for headless runs (`tune`
+  alone shows it). Retuning is shared by every front-end.
 - Decoders **stay on their channels** when you retune: each channel filter just follows the new
   centre. Decoders whose channel falls outside the new 2 MHz window go idle (greyed in the
   decoder list, their bands hidden) and resume when you tune back.
@@ -172,8 +181,12 @@ The dial uses the Antonio font (SIL Open Font License, `meshsdr/fonts/`).
   slot or frequency, or with another region's slot plan — US, ANZ, JP, … — all nine presets
   including ShortTurbo/LongTurbo, which don't fit EU_868's 250 kHz), MeshCore, a LoRaWAN plan or single channel, or another Trusted Wireless
   grid (offset). A preview lists the decoders it creates; names must be unique (a name given
-  for a plan or channel set becomes a prefix). Added decoders show in italics and can be
-  removed again from their ⚙ dialog; decoders from `config.jsonc` can only be unticked.
+  for a plan or channel set becomes a prefix). Added decoders show in italics.
+- **Remove / reset**: right click a decoder → *Remove decoder* (or its ⚙ dialog) takes any
+  decoder out of the list — an added one is deleted, a `config.jsonc` one is hidden in
+  `decoders.jsonc`. *↺ Reset* (below the list, or right click → *Reset to default decoders*)
+  drops every added, changed and removed decoder, back to the `config.jsonc` set with all
+  decoders off.
 - From the command line, live when a LoRaSpy runs, otherwise saved for its next start:
   ```bash
   ./loraspy.py decoder                                   # list (+ added, * changed)
@@ -182,10 +195,14 @@ The dial uses the Antonio font (SIL Open Font License, `meshsdr/fonts/`).
   ./loraspy.py decoder add protocol=trustedwireless offset_khz=-15 name=B
   ./loraspy.py decoder set LS2 sf=10 frequency=869.45M
   ./loraspy.py decoder reset LongFast
-  ./loraspy.py decoder remove LS2
+  ./loraspy.py decoder remove LS2                         # added: deleted; config: hidden
+  ./loraspy.py decoder reset-all                          # back to config.jsonc, all off
+  ./loraspy.py decoder enable LongFast MediumSlow         # switch on (they start off); 'all' for every one
+  ./loraspy.py decoder disable all
   ```
 - Everything is stored in `decoders.jsonc` next to `config.jsonc` (gitignored; `"add"` =
-  extra receiver specs, `"override"` = changed parameters per decoder) and merged at load, so
+  extra receiver specs, `"override"` = changed parameters per decoder, `"remove"` = hidden
+  `config.jsonc` decoders, `"enabled"` = decoders switched on) and merged at load, so
   `config.jsonc` itself is never rewritten. Every change is validated by loading the merged
   configuration first. Attached front-ends rebuild their decoder lists automatically.
 - The tuner is planned around the `config.jsonc` decoders only; an added decoder outside the

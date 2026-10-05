@@ -276,6 +276,8 @@ class Server:
                 result = core.decoder_reset(str(msg["name"]))
             elif op == "remove":
                 result = core.decoder_remove(str(msg["name"]))
+            elif op == "reset_all":
+                result = core.decoder_reset_all()
             elif op != "list":
                 raise ValueError(f"unknown decoder operation '{op}'")
             if op != "list":
@@ -336,7 +338,7 @@ class Server:
             c.fps = min(max(float(msg.get("fps", 0)), 0.0), 60.0)
             c.set_detectors({d for d in msg.get("detectors", []) if d in ("peak", "mean")})
         elif cmd == "enable":
-            self.core.set_receivers_enabled(set(msg.get("receivers", [])))
+            self.core.set_receivers_enabled(set(msg.get("receivers", [])), persist=True)
         elif cmd == "record":
             try:
                 if msg.get("op") == "status":

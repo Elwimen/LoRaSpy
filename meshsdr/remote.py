@@ -252,7 +252,8 @@ class RemoteCore:
 
     # ------------------------------------------------------------------ control (shared by all clients)
 
-    def set_receivers_enabled(self, names: set[str]):
+    def set_receivers_enabled(self, names: set[str], persist: bool = True):
+        # persist is implicit: the owner saves every enable command to its decoders.jsonc.
         for name, st in self.stats.items():
             st.enabled = name in names           # optimistic; the server's config message confirms
         self._send({"cmd": "enable", "receivers": sorted(names)})
@@ -312,6 +313,9 @@ class RemoteCore:
 
     def decoder_remove(self, name: str) -> list[str]:
         return self._request({"cmd": "decoder", "op": "remove", "name": name}, timeout=30)["result"]
+
+    def decoder_reset_all(self) -> str:
+        return self._request({"cmd": "decoder", "op": "reset_all"}, timeout=30)["result"]
 
     def channels(self) -> list[dict]:
         return list(self._channels)

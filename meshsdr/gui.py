@@ -289,12 +289,21 @@ class MonitorWindow(QtWidgets.QMainWindow):
         dlay = QtWidgets.QVBoxLayout(dec)
         dlay.setContentsMargins(0, 0, 0, 0)
         dlay.addWidget(self.tree)
+        btns = QtWidgets.QHBoxLayout()
+        btns.setContentsMargins(0, 0, 0, 0)
         add = QtWidgets.QPushButton("＋ Add decoder…")
         add.setToolTip("Add a decoder (Meshtastic preset, MeshCore, LoRaWAN plan or channel, FSK listener); "
                        "saved in decoders.jsonc")
         add.clicked.connect(self._add_decoder)
         add.setEnabled(hasattr(core, "decoder_add"))
-        dlay.addWidget(add)
+        btns.addWidget(add, 1)
+        reset_dec = QtWidgets.QPushButton("↺ Reset")
+        reset_dec.setToolTip("Reset to the config.jsonc decoders: drop every added/changed/removed decoder "
+                             "and switch them all off")
+        reset_dec.clicked.connect(self._reset_decoders)
+        reset_dec.setEnabled(hasattr(core, "decoder_reset_all"))
+        btns.addWidget(reset_dec)
+        dlay.addLayout(btns)
         self.boxes[2] = _box("²decoders", BOX["decoders"], dec)
         bottom.addWidget(self.boxes[2])
 
@@ -942,16 +951,64 @@ class MonitorWindow(QtWidgets.QMainWindow):
         AddDecoderDialog(self, self.core).exec()
         self._follow_receivers()
 
+    def _remove_decoder(self, name: str):
+        if not hasattr(self.core, "decoder_remove"):
+            return
+        info = next((d for d in self.core.decoder_list() if d["name"] == name), None)
+        also = info.get("spec_mates", []) if info else []
+        names = ", ".join([name, *also])
+        extra = "" if info and info["origin"] == "added" else \
+            "\n\nIt comes from config.jsonc — removing only hides it; “Reset to default decoders” brings it back."
+        if QtWidgets.QMessageBox.question(self, "Remove decoder", f"Remove {names}?{extra}") != \
+                QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
+        try:
+            gone = self.core.decoder_remove(name)
+        except ValueError as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, "Remove decoder", str(e))
+            return
+        finally:
+            if QtWidgets.QApplication.overrideCursor() is not None:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"removed {', '.join(gone)}", 4000)
+        self._follow_receivers()
+
+    def _reset_decoders(self):
+        if not hasattr(self.core, "decoder_reset_all"):
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Reset decoders",
+                "Reset to the config.jsonc decoders?\n\nThis drops every decoder added, changed or removed "
+                "from the UI and switches all decoders off.") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
+        try:
+            self.core.decoder_reset_all()
+        except ValueError as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, "Reset decoders", str(e))
+            return
+        finally:
+            if QtWidgets.QApplication.overrideCursor() is not None:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage("reset to the config.jsonc decoders (all idle)", 4000)
+        self._follow_receivers()
+
     def _tree_menu(self, pos):
         item = self.tree.itemAt(pos)
         name = item.data(0, QtCore.Qt.ItemDataRole.UserRole) if item else None
         menu = QtWidgets.QMenu(self)
-        dec = chan = None
+        dec = chan = rem = None
         if name and hasattr(self.core, "decoder_update"):
             dec = menu.addAction(f"⚙ Decoder settings… ({name})")
         if name and hasattr(self.core, "channels"):
             chan = menu.addAction(f"Channel settings… ({name})")
+        if name and hasattr(self.core, "decoder_remove"):
+            rem = menu.addAction(f"✕ Remove decoder ({name})")
         add = menu.addAction("＋ Add decoder…") if hasattr(self.core, "decoder_add") else None
+        reset = menu.addAction("↺ Reset to default decoders") if hasattr(self.core, "decoder_reset_all") else None
         act = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act is None:
             return
@@ -959,8 +1016,12 @@ class MonitorWindow(QtWidgets.QMainWindow):
             self._decoder_settings(name)
         elif act is chan:
             ChannelDialog(self, self.core, name).exec()
+        elif act is rem:
+            self._remove_decoder(name)
         elif act is add:
             self._add_decoder()
+        elif act is reset:
+            self._reset_decoders()
 
     def _tree_changed(self, item: QtWidgets.QTreeWidgetItem, col: int):
         """Receivers are enabled individually; group boxes just drive/reflect their children.
@@ -971,7 +1032,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
     def _apply_tree_now(self):
         on = {name for name, it in self.tree_items.items()
               if it.checkState(0) == QtCore.Qt.CheckState.Checked}
-        self.core.set_receivers_enabled(on)
+        self.core.set_receivers_enabled(on, persist=True)
         self.statusBar().showMessage(f"{len(on)} of {len(self.tree_items)} demodulators running "
                                      f"({len(self.tree_items) - len(on)} idle)", 4000)
 

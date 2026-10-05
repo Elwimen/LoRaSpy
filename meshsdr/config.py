@@ -216,6 +216,7 @@ class Config:
     lorawan_otaa: list[LoRaWANOTAADevice] = field(default_factory=list)
     source_path: Path | None = None
     keys_path: Path | None = None
+    enabled_decoders: set[str] | None = None   # decoders.jsonc "enabled"; None = never set (all idle)
     extra: dict = field(default_factory=dict)
 
 
@@ -400,8 +401,12 @@ def load_config(path: str | Path) -> Config:
                 rx.origin, rx.spec_index = "added", i
                 receivers.append(rx)
         apply_overrides(receivers, dec.get("override", {}))
+        removed = set(dec.get("remove", []))
+        if removed:                                   # config.jsonc decoders hidden from the UI
+            receivers = [r for r in receivers if r.name not in removed]
     except (ValueError, TypeError, KeyError) as e:
         raise ConfigError(f"{e} (receivers in config.jsonc / {DECODERS_FILE})") from e
+    enabled_decoders = set(dec["enabled"]) if "enabled" in dec else None
     names = [r.name for r in receivers]
     for dup in {n for n in names if names.count(n) > 1}:
         raise ConfigError(f"Two receivers are both named '{dup}'; give one an explicit \"name\"")
@@ -425,4 +430,4 @@ def load_config(path: str | Path) -> Config:
                   meshcore_channels=keys["meshcore_channels"], meshcore_identities=keys["meshcore_identities"],
                   meshcore_public_keys=keys["meshcore_public_keys"],
                   lorawan_sessions=keys["lorawan_sessions"], lorawan_otaa=keys["lorawan_otaa"],
-                  source_path=Path(path), keys_path=kpath)
+                  source_path=Path(path), keys_path=kpath, enabled_decoders=enabled_decoders)

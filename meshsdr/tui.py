@@ -440,7 +440,7 @@ class MonitorTUI(App):
             return
         name = dec.coordinate_to_cell_key(dec.cursor_coordinate).row_key.value
         on = {n for n, st in self.core.stats.items() if st.enabled} ^ {name}
-        self.core.set_receivers_enabled(on)   # gates the demodulator (and its filter) on/off
+        self.core.set_receivers_enabled(on, persist=True)   # gates the demodulator (and its filter) on/off
         self._slow()
 
     def action_toggle_proto(self, proto: str):
@@ -448,7 +448,7 @@ class MonitorTUI(App):
         mine = {rx.name for rx in self.core.cfg.receivers if rx.protocol == proto}
         on = {n for n, st in self.core.stats.items() if st.enabled}
         on = on - mine if on & mine else on | mine
-        self.core.set_receivers_enabled(on)
+        self.core.set_receivers_enabled(on, persist=True)
         self._slow()
 
     def action_keys(self):

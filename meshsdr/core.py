@@ -118,6 +118,11 @@ class MonitorCore:
         self.sample_rate = self.tb.sample_rate
         self.fft_size = fft_size
         self.window = spectrum_window
+        # Decoders start from the persisted "enabled" set (decoders.jsonc); none when it was never set.
+        initial = cfg.enabled_decoders if cfg.enabled_decoders is not None else set()
+        for name, st in self.stats.items():
+            st.enabled = name in initial
+        self.tb.set_enabled(initial)
         self.started = time.time()
         self._running = False
         self.finished = threading.Event()   # file source ran out
@@ -196,12 +201,18 @@ class MonitorCore:
             self._process(self._frames.get_nowait())
         self.save()
 
-    def set_receivers_enabled(self, names: set[str]):
-        """Enable exactly these receivers; the rest (and filters nobody uses) are gated off (~no CPU)."""
+    def set_receivers_enabled(self, names: set[str], persist: bool = False):
+        """Enable exactly these receivers; the rest (and filters nobody uses) are gated off (~no CPU).
+        With persist=True the choice is saved to decoders.jsonc and restored at the next start."""
         with self._reconf_lock:
             for name, st in self.stats.items():
                 st.enabled = name in names
             self.tb.set_enabled(names)
+        if persist and self.cfg.source_path is not None:
+            try:
+                self._decoder_store().set_enabled(n for n in names if n in self.stats)
+            except ValueError:
+                log.exception("could not save the enabled decoders")
         self._changed()
 
     def _changed(self):
@@ -345,11 +356,21 @@ class MonitorCore:
 
     def decoder_remove(self, name: str) -> list[str]:
         rx = next((r for r in self.cfg.receivers if r.name == name), None)
-        if rx is None or rx.origin != "added":
-            raise ValueError(f"'{name}' comes from config.jsonc: untick it, or remove it there")
-        names = self._decoder_store().remove(rx.spec_index)
+        if rx is None:
+            raise ValueError(f"unknown decoder '{name}'")
+        if rx.origin == "added":
+            names = self._decoder_store().remove(rx.spec_index)
+        else:                                          # config.jsonc: hidden, restored by reset_all
+            names = self._decoder_store().remove_config(name)
         self.rebuild()
         return names
+
+    def decoder_reset_all(self) -> str:
+        """Drop every UI addition, override and removal and switch all decoders off."""
+        self._decoder_store().reset_all()
+        self.rebuild()
+        self.set_receivers_enabled(set(), persist=False)
+        return "reset to the config.jsonc decoders (all idle)"
 
     def decoder_update(self, name: str, params: dict) -> str:
         """Change a decoder's parameters (persisted in decoders.jsonc). A frequency change of a
@@ -396,7 +417,7 @@ class MonitorCore:
             self._rebuilding = True
             try:
                 old = self.tb
-                enabled_before, known = self.enabled, set(self.stats)
+                enabled_before = self.enabled
                 g, center = old.gain_info(), old.center_hz
                 spectrum_on = old.spectrum.active
                 old.iq_tap.stop_all("stopped: the decoders were reconfigured")
@@ -430,7 +451,7 @@ class MonitorCore:
                     tb = build(self.cfg.receivers)
                     fresh = self.cfg
                 names = {r.name for r in fresh.receivers}
-                enabled = (enabled_before & names) | (names - known)
+                enabled = enabled_before & names       # keep current choices; new decoders start idle
                 tb.set_enabled(enabled)
                 tb.spectrum.active = spectrum_on
                 self.cfg.receivers = fresh.receivers
