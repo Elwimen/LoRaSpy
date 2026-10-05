@@ -35,6 +35,11 @@ from .radio import ReceiverParams, sync_word_symbols
 log = logging.getLogger(__name__)
 
 OS_FACTOR = 4  # samples per chip handed to gr-lora_sdr
+# FFT frames per second the spectrum tap computes. Far above any display rate (30-60 fps), yet far
+# below the sample rate: at 2 MS/s with a 1024-point FFT that is ~2000 FFTs/s, enough to starve the
+# decoders when a GUI owns the SDR. We decimate to this instead; the peak/mean detector over a
+# display frame still sees many FFTs, so bursts are not missed.
+SPECTRUM_FFT_PER_S = 256
 # Meshtastic transmits 16 preamble symbols, but telling frame_sync to expect 8 makes it lock
 # after fewer clean up-chirps; in simulation at -5..-12 dB SNR this decoded 36/36 frames vs 33/36.
 RX_PREAMBLE_LEN = 8
@@ -67,10 +72,12 @@ class SpectrumTap(gr.sync_block):
 
     CLIP_LEVEL = 0.97   # |I| or |Q| of a full-scale sample (8-bit ADC: raw 0..3 or 252..255)
 
-    def __init__(self, fft_size: int, window: str, on_spectrum: Callable[[np.ndarray], None] | None):
+    def __init__(self, fft_size: int, window: str, on_spectrum: Callable[[np.ndarray], None] | None,
+                 samp_rate: float = 0.0):
         gr.sync_block.__init__(self, name="spectrum_tap", in_sig=[np.complex64], out_sig=None)
         self.on_spectrum = on_spectrum
         self.active = False
+        self.samp_rate = float(samp_rate)
         # ADC level, always measured (cheap): (time, peak |I|/|Q|, clipped components, samples) per call
         self._adc: deque = deque(maxlen=4000)
         self._adc_lock = threading.Lock()
@@ -82,8 +89,12 @@ class SpectrumTap(gr.sync_block):
         from .ui_settings import gr_window
 
         taps = np.asarray(gr_window(window)(fft_size), dtype=np.float32)
+        # process only every _fft_decim-th FFT block, so the FFT rate ≈ SPECTRUM_FFT_PER_S whatever
+        # the sample rate or FFT size (1 = no decimation, e.g. a large FFT that is already slow enough)
+        decim = max(1, round(self.samp_rate / (fft_size * SPECTRUM_FFT_PER_S))) if self.samp_rate else 1
         with self._lock:
             self.fft_size, self.window, self._taps = fft_size, window, taps
+            self._fft_decim = decim
             self.window_gain = float(np.sum(taps)) ** 2   # |X|² of a full-scale tone → 0 dBFS
             self._rest = np.zeros(0, np.complex64)
 
@@ -112,12 +123,15 @@ class SpectrumTap(gr.sync_block):
                 self._adc.append(rec)
         if self.active and self.on_spectrum is not None:
             with self._lock:
-                n, taps = self.fft_size, self._taps
+                n, taps, decim = self.fft_size, self._taps, self._fft_decim
                 buf = np.concatenate((self._rest, x)) if len(self._rest) else x
                 k = len(buf) // n
                 self._rest = buf[k * n:].copy()
             if k:
-                spec = sp_fft.fft(buf[:k * n].reshape(k, n) * taps, axis=1)
+                frames = buf[:k * n].reshape(k, n)
+                if decim > 1:                      # a representative subset, not every block (CPU)
+                    frames = frames[::decim]
+                spec = sp_fft.fft(frames * taps, axis=1)
                 power = np.fft.fftshift(spec.real ** 2 + spec.imag ** 2, axes=1)
                 try:
                     self.on_spectrum(power)
@@ -346,7 +360,7 @@ class MonitorFlowgraph(gr.top_block):
         self.py_blocks = []
         # The source always feeds the spectrum tap (idle unless someone looks), which also keeps
         # the graph valid with every receiver off
-        self.spectrum = SpectrumTap(fft_size, spectrum_window or "Blackman-Harris", on_spectrum)
+        self.spectrum = SpectrumTap(fft_size, spectrum_window or "Blackman-Harris", on_spectrum, samp_rate)
         self.connect(source, self.spectrum)
         from .iqrec import IqTap
         self.iq_tap = IqTap()          # IQ recordings (idle unless one is armed)
@@ -608,6 +622,11 @@ class MonitorFlowgraph(gr.top_block):
         args = f"numchan=1 {sdr.device}"
         if sdr.bias_tee:
             args += ",bias=1"
+        # More/larger RTL ring buffers tolerate scheduling jitter (fewer "O" overruns on the console).
+        if getattr(sdr, "buffers", 0):
+            args += f",buffers={int(sdr.buffers)}"
+        if getattr(sdr, "buflen", 0):
+            args += f",buflen={int(sdr.buflen)}"
         src = osmosdr.source(args=args)
         src.set_sample_rate(sdr.sample_rate)
         actual = src.get_sample_rate()

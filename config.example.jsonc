@@ -20,6 +20,11 @@
     // "rssi_offset_db": -60,
     // "center_frequency_hz": 868844000,
     "bias_tee": false,          // power an LNA through the coax (RTL-SDR v4 supports this)
+    // If the console fills with "O" overruns (the dongle's buffer overflowed because the flowgraph
+    // fell behind the sample rate), raise the RTL ring buffering here. This smooths scheduling jitter;
+    // a sustained overrun instead means too many decoders for the CPU — enable fewer or lower sample_rate.
+    // "buffers": 32,           // number of RTL ring buffers (driver default ~15)
+    // "buflen": 262144,        // bytes per buffer (driver default 256 KiB; use multiples of 512)
   },
 
   // One or more demodulators per entry, all fed from the same SDR. Receivers on the same

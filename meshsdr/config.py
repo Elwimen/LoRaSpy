@@ -157,6 +157,8 @@ class SdrConfig:
     dc_clearance_hz: float = 25_000  # keep the RTL-SDR DC spike at least this far outside every channel
     rssi_offset_db: float | None = None  # dBm = dBFS + offset at the configured gain (calibrate!)
     bias_tee: bool = False
+    buffers: int = 0                 # gr-osmosdr RTL ring buffers (0 = driver default, ~15); raise to absorb jitter
+    buflen: int = 0                  # bytes per ring buffer (0 = driver default, 256 KiB); multiples of 512 B
 
 
 @dataclass
