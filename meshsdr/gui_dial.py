@@ -5,8 +5,15 @@ Every digit is its own control, as on SDR# / SDRangel dials:
 - mouse wheel over a digit: ±1 in that decade (carries into the higher digits),
 - right click on a digit: every digit to its right becomes 0,
 - leading zeros are dimmed; the hovered digit is highlighted.
-`changed(hz)` fires once the wheel has been still for DEBOUNCE_MS, so spinning through many
-steps retunes once.
+
+The dial also takes keyboard focus (click it or tab to it):
+- left / right: select a digit (the caret),
+- up / down: ±1 in the selected decade,
+- 0-9: set the selected digit and step right; backspace steps left,
+- home / end: jump to the most / least significant digit.
+
+`changed(hz)` fires once input has been still for DEBOUNCE_MS, so spinning or typing through
+many steps retunes once.
 """
 
 from pathlib import Path
@@ -38,11 +45,14 @@ class FrequencyDial(QtWidgets.QWidget):
         self.min_hz, self.max_hz, self.digits = min_hz, max_hz, digits
         self._value = int(round(hz))
         self._hover: int | None = None             # power of ten under the mouse
+        self._sel: int | None = None               # power of ten of the keyboard caret
         self.font_ = QtGui.QFont(lcars_family(), point_size)
         self.font_.setWeight(QtGui.QFont.Weight.DemiBold)
         self.unit_font = QtGui.QFont(lcars_family(), max(8, point_size // 2))
         self.setMouseTracking(True)
-        self.setToolTip(f"{what} — wheel over a digit: ±1 in that place · "
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setToolTip(f"{what} — wheel/up-down over a digit: ±1 in that place · "
+                        "left/right: pick a digit · type 0-9 to set it · "
                         "right click: zero the digits to its right")
         self._timer = QtCore.QTimer(self, singleShot=True)
         self._timer.timeout.connect(lambda: self.changed.emit(float(self._value)))
@@ -69,6 +79,10 @@ class FrequencyDial(QtWidgets.QWidget):
             self._value = v
             self.update()
         self._timer.start(0 if now else DEBOUNCE_MS)
+
+    def _set_digit(self, p: int, d: int, now: bool = False):
+        cur = (self._value // 10 ** p) % 10
+        self._set(self._value + (d - cur) * 10 ** p, now=now)
 
     # ---- geometry: digit cells, with a gap every three digits (GHz.MHz.kHz.Hz)
     def _layout(self):
@@ -106,6 +120,10 @@ class FrequencyDial(QtWidgets.QWidget):
                 qp.setBrush(QtGui.QColor(LCARS_HOVER))
                 qp.setPen(QtCore.Qt.PenStyle.NoPen)
                 qp.drawRoundedRect(r.adjusted(0, r.height() * 0.88, 0, 0), 2, 2)
+            if p == self._sel and self.hasFocus() and self.isEnabled():
+                qp.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                qp.setPen(QtGui.QPen(QtGui.QColor(LCARS_HOVER), 1.5))
+                qp.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -1.5), 2, 2)
             dim = i < lead or not self.isEnabled()
             qp.setPen(QtGui.QColor(LCARS_DIM if dim else LCARS_ORANGE))
             qp.drawText(r, QtCore.Qt.AlignmentFlag.AlignCenter, ch)
@@ -129,6 +147,63 @@ class FrequencyDial(QtWidgets.QWidget):
         self._hover = None
         self.update()
 
+    def _default_sel(self) -> int:
+        """Caret starts on the MHz ones digit, clamped into range."""
+        return max(0, min(6, self.digits - 1))
+
+    def focusInEvent(self, ev):
+        if self._sel is None:
+            self._sel = self._default_sel()
+        self.update()
+        super().focusInEvent(ev)
+
+    def focusOutEvent(self, ev):
+        self.update()
+        super().focusOutEvent(ev)
+
+    def keyPressEvent(self, ev):
+        if not self.isEnabled():
+            super().keyPressEvent(ev)
+            return
+        if self._sel is None:
+            self._sel = self._default_sel()
+        p, key = self._sel, ev.key()
+        Key = QtCore.Qt.Key
+        if key == Key.Key_Left:
+            self._sel = min(self.digits - 1, p + 1)
+        elif key == Key.Key_Right:
+            self._sel = max(0, p - 1)
+        elif key == Key.Key_Up:
+            self._set(self._value + 10 ** p)
+        elif key == Key.Key_Down:
+            self._set(self._value - 10 ** p)
+        elif key == Key.Key_Home:
+            self._sel = self.digits - 1
+        elif key == Key.Key_End:
+            self._sel = 0
+        elif key == Key.Key_Backspace:
+            self._sel = min(self.digits - 1, p + 1)
+        elif ev.text().isdigit():
+            self._set_digit(p, int(ev.text()))
+            self._sel = max(0, p - 1)
+        else:
+            super().keyPressEvent(ev)
+            return
+        self.update()
+        ev.accept()
+
+    _NAV_KEYS = frozenset({QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_Right, QtCore.Qt.Key.Key_Up,
+                           QtCore.Qt.Key.Key_Down, QtCore.Qt.Key.Key_Home, QtCore.Qt.Key.Key_End,
+                           QtCore.Qt.Key.Key_Backspace})
+
+    def event(self, ev):
+        """When focused, claim the digit/arrow keys so a single-key app shortcut can't steal them."""
+        if (ev.type() == QtCore.QEvent.Type.ShortcutOverride and self.hasFocus() and self.isEnabled()
+                and (ev.key() in self._NAV_KEYS or ev.text().isdigit())):
+            ev.accept()
+            return True
+        return super().event(ev)
+
     def wheelEvent(self, ev):
         p = self._cell_at(ev.position())
         if p is None or not self.isEnabled():
@@ -143,4 +218,8 @@ class FrequencyDial(QtWidgets.QWidget):
             return
         if ev.button() == QtCore.Qt.MouseButton.RightButton and p > 0:
             self._set((self._value // 10 ** p) * 10 ** p, now=True)
+            ev.accept()
+        elif ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._sel = p
+            self.update()
             ev.accept()
