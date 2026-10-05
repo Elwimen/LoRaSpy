@@ -346,12 +346,12 @@ class MonitorWindow(QtWidgets.QMainWindow):
         keys.triggered.connect(self._open_keys)
         tb.addAction(keys)
         tb.addSeparator()
-        # btop-style: 1-4 show/hide the numbered boxes
+        # btop-style: Ctrl+1-4 show/hide the numbered boxes (plain 1-4 type into the frequency dial)
         self.box_actions = {}
         for n, name in ((1, "spectrum"), (2, "decoders"), (3, "packets"), (4, "details")):
             a = QtGui.QAction(f"{'¹²³⁴'[n - 1]}{name}", self, checkable=True, checked=True)
-            a.setShortcut(QtGui.QKeySequence(str(n)))
-            a.setToolTip(f"show/hide the {name} box (key {n})")
+            a.setShortcut(QtGui.QKeySequence(f"Ctrl+{n}"))
+            a.setToolTip(f"show/hide the {name} box (Ctrl+{n})")
             a.toggled.connect(lambda on, n=n: self._show_box(n, on))
             tb.addAction(a)
             self.box_actions[n] = a
