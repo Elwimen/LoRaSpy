@@ -35,7 +35,8 @@ def default_socket_path() -> str:
     run = os.environ.get("XDG_RUNTIME_DIR")
     if run and os.path.isdir(run):
         return os.path.join(run, "loraspy.sock")
-    return os.path.join(tempfile.gettempdir(), f"loraspy-{os.getuid()}.sock")
+    uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    return os.path.join(tempfile.gettempdir(), f"loraspy-{uid}.sock")
 
 
 def pack_json(obj: dict) -> bytes:

@@ -1009,7 +1009,8 @@ def main() -> int:
         args = parser.parse_args(sys.argv[1:] + ["listen"])
     logging.basicConfig(level=args.log_level, format="%(levelname)s %(name)s: %(message)s")
     import faulthandler
-    faulthandler.register(signal.SIGUSR1, all_threads=True)   # kill -USR1 <pid>: dump every thread's stack
+    if hasattr(faulthandler, "register") and hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)   # kill -USR1 <pid>: dump every thread's stack (POSIX only)
     try:
         cfg = load_config(args.config)
     except FileNotFoundError:

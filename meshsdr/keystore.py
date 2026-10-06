@@ -220,7 +220,8 @@ class KeyStore:
         text = HEADER + json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".keys.", suffix=".tmp")
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):          # POSIX: keys file user-only (no-op on Windows)
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text)
             os.replace(tmp, self.path)
