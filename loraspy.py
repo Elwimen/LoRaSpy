@@ -380,14 +380,32 @@ def apply_source_args(cfg, args):
 SOURCE_OPTS = ("gain", "ppm", "hard_decoding", "iq_file", "iq_rate", "iq_center", "iq_loop", "realtime")
 
 
+def _radio_stack_missing(exc: ImportError):
+    """A clear message when the native SDR stack isn't installed, instead of a raw traceback."""
+    missing = getattr(exc, "name", "") or str(exc)
+    print(
+        f"error: the GNU Radio SDR stack is not available ({missing}).\n"
+        "LoRaSpy needs GNU Radio 3.10, gr-osmosdr and gr-lora_sdr — these are native packages,\n"
+        "NOT pip/requirements.txt installs. 'pip install gnuradio' does not exist.\n"
+        "  • Linux:   install via your distro (e.g. pacman -S gnuradio gnuradio-osmosdr rtl-sdr),\n"
+        "             then ./scripts/build_gr_lora_sdr.sh for gr-lora_sdr.\n"
+        "  • Windows: use WSL2 — see docs/WINDOWS.md. (Native Windows has no gr-lora_sdr build.)\n"
+        "Commands that don't touch the SDR still work: loraspy.py info | decoder | keys.",
+        file=sys.stderr)
+    return 3
+
+
 def open_local_core(cfg, args, ust, *, live_view: bool):
     """Open the SDR (or IQ file) with its own decoders."""
     from meshsdr.core import MonitorCore
 
     apply_source_args(cfg, args)
-    return MonitorCore(cfg, iq_file=args.iq_file, iq_format=args.iq_format, iq_center_hz=args.iq_center,
-                       soft_decoding=not args.hard_decoding, fft_size=ust.fft_size, spectrum_window=ust.window,
-                       realtime=args.realtime or (live_view and args.iq_file is not None), iq_loop=args.iq_loop)
+    try:
+        return MonitorCore(cfg, iq_file=args.iq_file, iq_format=args.iq_format, iq_center_hz=args.iq_center,
+                           soft_decoding=not args.hard_decoding, fft_size=ust.fft_size, spectrum_window=ust.window,
+                           realtime=args.realtime or (live_view and args.iq_file is not None), iq_loop=args.iq_loop)
+    except ImportError as e:               # gnuradio / pmt / osmosdr / gr-lora_sdr not installed
+        raise SystemExit(_radio_stack_missing(e)) from e
 
 
 def start_sharing(core, cfg, args, path: str):

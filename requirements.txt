@@ -1,5 +1,10 @@
-# GNU Radio 3.10 + gr-osmosdr come from the distro (pacman -S gnuradio gnuradio-osmosdr rtl-sdr);
-# gr-lora_sdr from scripts/build_gr_lora_sdr.sh or AUR gr-lora_sdr-git.
+# pip installs ONLY the pure-Python packages below.
+#
+# The SDR stack is NATIVE and is NOT pip-installable (there is no `pip install gnuradio`):
+#   - GNU Radio 3.10 + gr-osmosdr: from your distro — Arch: pacman -S gnuradio gnuradio-osmosdr rtl-sdr
+#   - gr-lora_sdr: scripts/build_gr_lora_sdr.sh (or AUR gr-lora_sdr-git)
+#   - For the GUI: pyqtgraph + a Qt binding (e.g. pip install pyqtgraph pyqt5); for the TUI: textual
+#   - Windows: there is no native gr-lora_sdr build — run under WSL2 (see docs/WINDOWS.md)
 meshtastic>=2.5
 cryptography
 protobuf
