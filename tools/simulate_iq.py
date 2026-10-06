@@ -28,7 +28,10 @@ from scipy.signal import resample_poly
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pmt  # noqa: E402
+try:
+    import pmt  # noqa: E402
+except ImportError:
+    from gnuradio import pmt  # noqa: E402
 from gnuradio import blocks, gr  # noqa: E402
 from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2  # noqa: E402
 

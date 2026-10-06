@@ -23,7 +23,10 @@ from typing import Callable
 
 import numpy as np
 import scipy.fft as sp_fft
-import pmt
+try:
+    import pmt                       # GNU Radio exposes pmt as a top-level module (most Linux builds)
+except ImportError:
+    from gnuradio import pmt         # …or only under the package (some conda/Windows builds)
 from gnuradio import blocks, filter, gr
 from gnuradio.filter import firdes
 
